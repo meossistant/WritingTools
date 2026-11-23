@@ -991,6 +991,99 @@ class WritingToolApp(QtWidgets.QApplication):
 
         threading.Thread(target=process_thread, daemon=True).start()
 
+    def regenerate_response(self, response_window, is_initial: bool = False):
+        """
+        Regenerate the latest assistant response in `response_window` (#148).
+        Reuses the window's active provider & model override.
+        """
+        logging.debug(f"Regenerating response (option={response_window.option}, is_initial={is_initial})")
+
+        def regen_thread():
+            try:
+                active_provider = (
+                    getattr(response_window, "active_provider", None) or self.current_provider
+                )
+                model_override = getattr(response_window, "model_override", None)
+                if active_provider is None:
+                    self.show_message_signal.emit("Error", "No AI provider configured. Please open Settings.")
+                    return
+
+                self._active_request_provider = active_provider
+
+                if is_initial:
+                    option = response_window.option
+                    option_cfg = (self.options or {}).get(option, {})
+                    selected_text = response_window.selected_text or ""
+                    prompt_prefix = option_cfg.get("prefix", "")
+                    system_instruction = option_cfg.get("instruction", "")
+                    if getattr(active_provider, "is_non_ai", False):
+                        prompt = selected_text
+                    elif option == "Custom":
+                        custom_change = getattr(response_window, "custom_change", "") or ""
+                        prompt = f"{prompt_prefix}Described change: {custom_change}\n\nText: {selected_text}"
+                    else:
+                        prompt = f"{prompt_prefix}{selected_text}"
+
+                    response_text = active_provider.get_response(
+                        system_instruction,
+                        prompt,
+                        return_response=True,
+                        model_override=model_override,
+                    )
+                    if not getattr(response_window, "_closed", False):
+                        if response_text:
+                            QtCore.QMetaObject.invokeMethod(
+                                response_window,
+                                "set_text",
+                                QtCore.Qt.ConnectionType.QueuedConnection,
+                                QtCore.Q_ARG(str, response_text),
+                            )
+                        else:
+                            QtCore.QMetaObject.invokeMethod(
+                                response_window,
+                                "stop_thinking_animation",
+                                QtCore.Qt.ConnectionType.QueuedConnection,
+                            )
+                else:
+                    history = list(response_window.chat_history)
+                    if not history:
+                        QtCore.QMetaObject.invokeMethod(
+                            response_window,
+                            "stop_thinking_animation",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                        )
+                        return
+
+                    system_instruction = (
+                        "You are a helpful AI assistant. Provide clear and direct responses, "
+                        "maintaining the same format and style as your previous responses. "
+                        "If appropriate, use Markdown formatting to make your response more readable."
+                    )
+                    response_text = active_provider.get_response(
+                        system_instruction,
+                        history,
+                        return_response=True,
+                        model_override=model_override,
+                    )
+                    if not getattr(response_window, "_closed", False):
+                        QtCore.QMetaObject.invokeMethod(
+                            response_window,
+                            "handle_followup_response",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                            QtCore.Q_ARG(str, response_text or ""),
+                        )
+            except Exception as e:
+                logging.error(f"Error regenerating response: {e}", exc_info=True)
+                self.show_message_signal.emit("Error", f"An error occurred: {e}")
+                if not getattr(response_window, "_closed", False):
+                    QtCore.QMetaObject.invokeMethod(
+                        response_window,
+                        "stop_thinking_animation",
+                        QtCore.Qt.ConnectionType.QueuedConnection,
+                    )
+
+        threading.Thread(target=regen_thread, daemon=True).start()
+
     def show_settings(self, providers_only=False):
         logging.debug("Showing settings window")
         self.settings_window = settings_window.SettingsWindow(self, providers_only=providers_only)

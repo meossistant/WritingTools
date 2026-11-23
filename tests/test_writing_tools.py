@@ -88,6 +88,11 @@ class DummyApp:
     def process_followup_question(self, window, msg):
         self.followup_calls.append((window, msg))
 
+    def regenerate_response(self, window, is_initial=False):
+        if not hasattr(self, "regenerate_calls"):
+            self.regenerate_calls = []
+        self.regenerate_calls.append((window, is_initial))
+
     @staticmethod
     def _to_pynput_hotkey(hotkey_str):
         return WritingToolApp._to_pynput_hotkey(hotkey_str)
@@ -697,4 +702,74 @@ def test_per_button_provider_and_model_override(qapp):
     entry = CustomPopupWindow._build_button_entry(bd)
     assert entry["provider"] == lt.provider_name
     assert entry["model"] == "en-GB"
+
+
+def test_word_diff_merging_and_theme_colors():
+    # Issues #284, #25, #206: word-level diff with adjacent phrase merging
+    from writing_tools.diff_utils import build_word_diff
+
+    res = build_word_diff(
+        "The quick brown fox jumped over the lazy dog.",
+        "The fast red fox leaped over the lazy dog.",
+        color_mode="light",
+    )
+    assert res.has_changes is True
+    assert res.deletions == 3
+    assert res.insertions == 3
+    # Adjacent "quick brown" -> "fast red" merged into a single deleted span + inserted span
+    assert "quick brown</span>" in res.html
+    assert "fast red</span>" in res.html
+    assert "line-through" in res.html
+
+    same = build_word_diff("No edits here.", "No edits here.", color_mode="dark")
+    assert same.has_changes is False
+    assert "No changes detected" in same.html
+
+
+def test_response_window_diff_toggle_regenerate_original_and_formatted_copy(qapp):
+    # Issues #284, #148, #127: Changes|Result toggle, Regenerate, Original panel, Copy Formatted
+    app = DummyApp()
+    win = ResponseWindow(app, "Proofread Result")
+    win.selected_text = "I recieve an exampel."
+    win.set_text("I **receive** an example.")
+
+    assert win.changes_mode_btn.isEnabled() is True
+    assert win.regenerate_btn.isEnabled() is True
+
+    # Toggle to Changes (word-level diff)
+    win.set_diff_mode(True)
+    assert win.diff_mode is True
+    assert "line-through" in win.first_response_display.toHtml()
+
+    # Toggle back to Result (rendered Markdown)
+    win.set_diff_mode(False)
+    assert win.diff_mode is False
+    assert "receive" in win.first_response_display.toPlainText()
+
+    # Collapsible original text box (#127)
+    assert win.original_text_box.isHidden() is True
+    win.original_toggle_btn.setChecked(True)
+    assert win.original_text_box.isHidden() is False
+    assert win.original_text_box.toPlainText() == "I recieve an exampel."
+
+    # Copy Formatted (#127) populates HTML + clean plain text mime data
+    win.copy_latest_formatted()
+    mime = QtWidgets.QApplication.clipboard().mimeData()
+    assert mime.hasHtml()
+    assert "receive" in mime.html()
+    assert mime.text().strip() == "I receive an example."
+
+    # Regenerate button (#148) triggers initial regeneration and removes stale assistant turn
+    win.regenerate_latest_response()
+    assert len(app.regenerate_calls) == 1
+    assert app.regenerate_calls[0] == (win, True)
+    assert all(m["role"] != "assistant" for m in win.chat_history)
+
+    # Status notice banner
+    win.set_status_notice("Window focus changed.")
+    assert win.status_banner.isHidden() is False
+    assert win.status_banner.text() == "Window focus changed."
+
+    win.close()
+
 

@@ -6,6 +6,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import QScrollArea
 
+from writing_tools.diff_utils import build_word_diff
 from writing_tools.paths import get_resource_path
 from writing_tools.ui.ui_utils import COLOR_MODE, UIUtils
 
@@ -244,6 +245,40 @@ class ChatContentScrollArea(QScrollArea):
         QtCore.QTimer.singleShot(50, self.post_message_updates)
         return text_display
 
+    def remove_last_message(self):
+        """Remove the most recently added message widget (used by Regenerate)."""
+        # Layout always ends with a trailing stretch item
+        if self.layout.count() <= 1:
+            return
+        item = self.layout.takeAt(self.layout.count() - 2)
+        removed_widget = item.widget() if item else None
+        response_window = self.get_response_window()
+        if removed_widget is not None:
+            if response_window is not None:
+                if (
+                    response_window.current_text_display is not None
+                    and removed_widget.isAncestorOf(response_window.current_text_display)
+                ):
+                    response_window.current_text_display = None
+                if (
+                    response_window.first_response_display is not None
+                    and removed_widget.isAncestorOf(response_window.first_response_display)
+                ):
+                    response_window.first_response_display = None
+            removed_widget.setParent(None)
+            removed_widget.deleteLater()
+        self.update_content_height()
+
+    def clear_messages(self):
+        """Remove all message widgets while preserving the trailing stretch."""
+        while self.layout.count() > 1:
+            item = self.layout.takeAt(0)
+            if item and item.widget():
+                w = item.widget()
+                w.setParent(None)
+                w.deleteLater()
+        self.update_content_height()
+
     def post_message_updates(self):
         self.scroll_to_bottom()
         response_window = self.get_response_window()
@@ -288,7 +323,11 @@ class ChatContentScrollArea(QScrollArea):
 
 
 class ResponseWindow(QtWidgets.QWidget):
-    """Response window with Markdown rendering, zoom persistence, and follow-up chat."""
+    """
+    Response window with Markdown rendering, word-level diff toggle (#284),
+    one-click regeneration (#148), collapsible original text (#127),
+    formatted & Markdown copy, zoom persistence, and follow-up chat.
+    """
 
     def __init__(self, app, title=_("Response"), parent=None):
         super().__init__(parent)
@@ -297,11 +336,23 @@ class ResponseWindow(QtWidgets.QWidget):
         self.setWindowTitle(title)
         self.option = title.replace(" Result", "")
         self.selected_text = None
+        self.custom_change = None
+        self.active_provider = None
+        self.model_override = None
         self.input_field = None
         self.loading_label = None
         self.loading_container = None
         self.chat_area = None
         self.current_text_display = None
+        self.first_response_display = None
+        self.first_response_markdown = ""
+        self.diff_mode = False
+        self.result_mode_btn = None
+        self.changes_mode_btn = None
+        self.regenerate_btn = None
+        self.original_toggle_btn = None
+        self.original_text_box = None
+        self.status_banner = None
         self.chat_history = []
         self._closed = False
 
@@ -312,7 +363,7 @@ class ResponseWindow(QtWidgets.QWidget):
         self.thinking_timer.setInterval(300)
 
         self.init_ui()
-        self.resize(600, 400)
+        self.resize(640, 440)
 
     def init_ui(self):
         self.setWindowFlags(
@@ -321,7 +372,7 @@ class ResponseWindow(QtWidgets.QWidget):
             | QtCore.Qt.WindowType.WindowMinimizeButtonHint
             | QtCore.Qt.WindowType.WindowMaximizeButtonHint
         )
-        self.setMinimumSize(600, 400)
+        self.setMinimumSize(620, 420)
 
         UIUtils.setup_window_and_layout(self)
         content_layout = QtWidgets.QVBoxLayout(self.background)
@@ -337,11 +388,28 @@ class ResponseWindow(QtWidgets.QWidget):
         top_bar.addWidget(title_label)
         top_bar.addStretch()
 
+        # Regenerate button (#148) using bundled regenerate_{dark,light}.png icon
+        self.regenerate_btn = QtWidgets.QPushButton()
+        regen_icon_path = get_resource_path(
+            "icons", "regenerate" + ("_dark" if COLOR_MODE == "dark" else "_light") + ".png"
+        )
+        if os.path.exists(regen_icon_path):
+            self.regenerate_btn.setIcon(QtGui.QIcon(regen_icon_path))
+        else:
+            self.regenerate_btn.setText("R")
+        self.regenerate_btn.setStyleSheet(self.get_button_style())
+        self.regenerate_btn.setToolTip(_("Regenerate latest response"))
+        self.regenerate_btn.clicked.connect(self.regenerate_latest_response)
+        self.regenerate_btn.setFixedSize(30, 30)
+        self.regenerate_btn.setEnabled(False)
+        top_bar.addWidget(self.regenerate_btn)
+
         zoom_label = QtWidgets.QLabel("Zoom:")
         zoom_label.setStyleSheet(
             f"""
             color: {'#aaaaaa' if COLOR_MODE == 'dark' else '#666666'};
             font-size: 14px;
+            margin-left: 8px;
             margin-right: 5px;
         """
         )
@@ -368,19 +436,86 @@ class ResponseWindow(QtWidgets.QWidget):
 
         content_layout.addLayout(top_bar)
 
-        copy_bar = QtWidgets.QHBoxLayout()
-        copy_hint = QtWidgets.QLabel(_("Select to copy with formatting"))
-        copy_hint.setStyleSheet(
-            f"color: {'#aaaaaa' if COLOR_MODE == 'dark' else '#666666'}; font-size: 14px;"
+        # Optional status notice banner (e.g., focus changed before paste)
+        self.status_banner = QtWidgets.QLabel()
+        self.status_banner.setWordWrap(True)
+        self.status_banner.setStyleSheet(
+            f"""
+            QLabel {{
+                background-color: {'#3a3218' if COLOR_MODE == 'dark' else '#fef9c3'};
+                color: {'#fde68a' if COLOR_MODE == 'dark' else '#854d0e'};
+                border: 1px solid {'#713f12' if COLOR_MODE == 'dark' else '#facc15'};
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+            }}
+        """
         )
-        copy_bar.addWidget(copy_hint)
-        copy_bar.addStretch()
+        self.status_banner.hide()
+        content_layout.addWidget(self.status_banner)
+
+        # Action bar: [Result | Changes] toggle, Original toggle, Copy Formatted, Copy as Markdown
+        action_bar = QtWidgets.QHBoxLayout()
+        action_bar.setSpacing(6)
+
+        self.result_mode_btn = QtWidgets.QPushButton(_("Result"))
+        self.result_mode_btn.setCheckable(True)
+        self.result_mode_btn.setChecked(True)
+        self.result_mode_btn.setEnabled(False)
+        self.result_mode_btn.setStyleSheet(self._get_toggle_button_style())
+        self.result_mode_btn.clicked.connect(lambda: self.set_diff_mode(False))
+        action_bar.addWidget(self.result_mode_btn)
+
+        self.changes_mode_btn = QtWidgets.QPushButton(_("Changes"))
+        self.changes_mode_btn.setCheckable(True)
+        self.changes_mode_btn.setChecked(False)
+        self.changes_mode_btn.setEnabled(False)
+        self.changes_mode_btn.setToolTip(_("Show word-level diff against original selection"))
+        self.changes_mode_btn.setStyleSheet(self._get_toggle_button_style())
+        self.changes_mode_btn.clicked.connect(lambda: self.set_diff_mode(True))
+        action_bar.addWidget(self.changes_mode_btn)
+
+        self.original_toggle_btn = QtWidgets.QPushButton(_("Original"))
+        self.original_toggle_btn.setCheckable(True)
+        self.original_toggle_btn.setChecked(False)
+        self.original_toggle_btn.setToolTip(_("Show or hide the original selected text"))
+        self.original_toggle_btn.setStyleSheet(self._get_toggle_button_style())
+        self.original_toggle_btn.toggled.connect(self._toggle_original_panel)
+        action_bar.addWidget(self.original_toggle_btn)
+
+        action_bar.addStretch()
+
+        copy_fmt_btn = QtWidgets.QPushButton(_("Copy Formatted"))
+        copy_fmt_btn.setToolTip(_("Copy latest response as formatted rich text"))
+        copy_fmt_btn.setStyleSheet(self.get_button_style())
+        copy_fmt_btn.clicked.connect(self.copy_latest_formatted)
+        action_bar.addWidget(copy_fmt_btn)
 
         copy_md_btn = QtWidgets.QPushButton(_("Copy as Markdown"))
+        copy_md_btn.setToolTip(_("Copy latest response as Markdown"))
         copy_md_btn.setStyleSheet(self.get_button_style())
         copy_md_btn.clicked.connect(self.copy_latest_response)
-        copy_bar.addWidget(copy_md_btn)
-        content_layout.addLayout(copy_bar)
+        action_bar.addWidget(copy_md_btn)
+        content_layout.addLayout(action_bar)
+
+        # Collapsible original text viewer (#127)
+        self.original_text_box = QtWidgets.QPlainTextEdit()
+        self.original_text_box.setReadOnly(True)
+        self.original_text_box.setMaximumHeight(110)
+        self.original_text_box.setStyleSheet(
+            f"""
+            QPlainTextEdit {{
+                background-color: {'#2a2a2a' if COLOR_MODE == 'dark' else '#f8f9fa'};
+                color: {'#dddddd' if COLOR_MODE == 'dark' else '#333333'};
+                border: 1px solid {'#555' if COLOR_MODE == 'dark' else '#ccc'};
+                border-radius: 6px;
+                padding: 6px;
+                font-size: 13px;
+            }}
+        """
+        )
+        self.original_text_box.hide()
+        content_layout.addWidget(self.original_text_box)
 
         loading_container = QtWidgets.QWidget()
         loading_layout = QtWidgets.QHBoxLayout(loading_container)
@@ -494,6 +629,111 @@ class ResponseWindow(QtWidgets.QWidget):
         if response_text:
             QtWidgets.QApplication.clipboard().setText(response_text)
 
+    def copy_latest_formatted(self):
+        """Copy the latest AI response as formatted rich text + clean plain text (#127)."""
+        response_text = self.get_latest_response_text()
+        if not response_text:
+            return
+        html_content = markdown2.markdown(
+            response_text, extras=["tables", "strike", "fenced-code-blocks"]
+        )
+        helper = QtWidgets.QTextEdit()
+        helper.setHtml(html_content)
+        helper.selectAll()
+        helper.copy()
+
+    def set_status_notice(self, message: str):
+        """Show or hide an informational banner inside the response window."""
+        if not self.status_banner:
+            return
+        if message:
+            self.status_banner.setText(message)
+            self.status_banner.show()
+        else:
+            self.status_banner.hide()
+
+    def _toggle_original_panel(self, checked: bool):
+        if self.original_text_box is None:
+            return
+        if checked:
+            self.original_text_box.setPlainText(self.selected_text or "")
+            self.original_text_box.show()
+        else:
+            self.original_text_box.hide()
+
+    def set_diff_mode(self, show_diff: bool):
+        """Switch the initial response between rendered Markdown (`Result`) and word-level diff (`Changes`)."""
+        self.diff_mode = bool(show_diff)
+        if self.result_mode_btn is not None:
+            self.result_mode_btn.setChecked(not self.diff_mode)
+        if self.changes_mode_btn is not None:
+            self.changes_mode_btn.setChecked(self.diff_mode)
+
+        if self.first_response_display is None or not self.first_response_markdown:
+            return
+
+        if self.diff_mode and self.selected_text is not None:
+            diff_res = build_word_diff(
+                self.selected_text, self.first_response_markdown, color_mode=COLOR_MODE
+            )
+            self.first_response_display.setHtml(diff_res.html)
+        else:
+            html_content = markdown2.markdown(
+                self.first_response_markdown, extras=["tables", "strike", "fenced-code-blocks"]
+            )
+            self.first_response_display.setHtml(html_content)
+        self.first_response_display._update_size()
+
+    def regenerate_latest_response(self):
+        """Regenerate the latest assistant response in-place (#148)."""
+        if self._closed or not hasattr(self.app, "regenerate_response"):
+            return
+
+        # Determine whether we are regenerating the initial turn or a follow-up turn
+        is_initial = sum(1 for m in self.chat_history if m.get("role") == "assistant") <= 1
+
+        if self.chat_history and self.chat_history[-1].get("role") == "assistant":
+            self.chat_history.pop()
+            self.chat_area.remove_last_message()
+
+        if is_initial:
+            self.first_response_display = None
+            self.first_response_markdown = ""
+            self.diff_mode = False
+            if self.result_mode_btn is not None:
+                self.result_mode_btn.setChecked(True)
+                self.result_mode_btn.setEnabled(False)
+            if self.changes_mode_btn is not None:
+                self.changes_mode_btn.setChecked(False)
+                self.changes_mode_btn.setEnabled(False)
+
+        if self.regenerate_btn is not None:
+            self.regenerate_btn.setEnabled(False)
+        self.input_field.setEnabled(False)
+        self.start_thinking_animation(initial=is_initial)
+        self.app.regenerate_response(self, is_initial=is_initial)
+
+    def _get_toggle_button_style(self):
+        return f"""
+            QPushButton {{
+                background-color: {'#444' if COLOR_MODE == 'dark' else '#f0f0f0'};
+                color: {'#ffffff' if COLOR_MODE == 'dark' else '#000000'};
+                border: 1px solid {'#666' if COLOR_MODE == 'dark' else '#ccc'};
+                border-radius: 5px;
+                padding: 6px 10px;
+                font-size: 13px;
+            }}
+            QPushButton:checked {{
+                background-color: {'#2e7d32' if COLOR_MODE == 'dark' else '#0078d4'};
+                color: #ffffff;
+                border: 1px solid {'#4caf50' if COLOR_MODE == 'dark' else '#005a9e'};
+                font-weight: bold;
+            }}
+            QPushButton:disabled {{
+                color: {'#777' if COLOR_MODE == 'dark' else '#999'};
+            }}
+        """
+
     def get_button_style(self):
         return f"""
             QPushButton {{
@@ -501,8 +741,8 @@ class ResponseWindow(QtWidgets.QWidget):
                 color: {'#ffffff' if COLOR_MODE == 'dark' else '#000000'};
                 border: 1px solid {'#666' if COLOR_MODE == 'dark' else '#ccc'};
                 border-radius: 5px;
-                padding: 8px;
-                font-size: 14px;
+                padding: 6px 10px;
+                font-size: 13px;
             }}
             QPushButton:hover {{
                 background-color: {'#555' if COLOR_MODE == 'dark' else '#e0e0e0'};
@@ -536,6 +776,8 @@ class ResponseWindow(QtWidgets.QWidget):
         self.loading_label.hide()
         self.input_field.setPlaceholderText(_("Ask a follow-up question") + "...")
         self.input_field.setEnabled(True)
+        if self.regenerate_btn is not None:
+            self.regenerate_btn.setEnabled(bool(self.chat_history))
 
         if self.layout():
             self.layout().invalidate()
@@ -576,7 +818,7 @@ class ResponseWindow(QtWidgets.QWidget):
             desired_content_height = int(content_height * 0.85)
             desired_total_height = min(desired_content_height + ui_elements_height, max_height)
             final_height = max(600, desired_total_height)
-            final_width = 600
+            final_width = 640
 
             self.resize(final_width, final_height)
 
@@ -586,7 +828,7 @@ class ResponseWindow(QtWidgets.QWidget):
             self._size_initialized = True
         except Exception as e:
             logging.error(f"Error adjusting window height: {e}")
-            self.resize(600, 600)
+            self.resize(640, 600)
             self._size_initialized = True
 
     def _get_current_zoom(self) -> float:
@@ -611,6 +853,7 @@ class ResponseWindow(QtWidgets.QWidget):
             {"role": "user", "content": f"{self.option}: {self.selected_text}"},
             {"role": "assistant", "content": text},
         ]
+        self.first_response_markdown = text
 
         self.stop_thinking_animation()
         zoom = self._get_current_zoom()
@@ -618,6 +861,19 @@ class ResponseWindow(QtWidgets.QWidget):
         text_display.zoom_factor = zoom
         text_display._apply_zoom()
         text_display._update_size()
+        self.first_response_display = text_display
+
+        has_original = bool(self.selected_text)
+        if self.result_mode_btn is not None:
+            self.result_mode_btn.setEnabled(has_original)
+            self.result_mode_btn.setChecked(True)
+        if self.changes_mode_btn is not None:
+            self.changes_mode_btn.setEnabled(has_original)
+            self.changes_mode_btn.setChecked(False)
+        if self.regenerate_btn is not None:
+            self.regenerate_btn.setEnabled(True)
+        if self.original_text_box is not None and self.original_text_box.isVisible():
+            self.original_text_box.setPlainText(self.selected_text or "")
 
         QtCore.QTimer.singleShot(100, self._adjust_window_height)
 
@@ -638,6 +894,8 @@ class ResponseWindow(QtWidgets.QWidget):
 
         self.stop_thinking_animation()
         self.input_field.setEnabled(True)
+        if self.regenerate_btn is not None:
+            self.regenerate_btn.setEnabled(True)
         QtCore.QTimer.singleShot(100, self._adjust_window_height)
 
     def send_message(self):
@@ -646,6 +904,8 @@ class ResponseWindow(QtWidgets.QWidget):
             return
 
         self.input_field.setEnabled(False)
+        if self.regenerate_btn is not None:
+            self.regenerate_btn.setEnabled(False)
         self.input_field.clear()
 
         zoom = self._get_current_zoom()
