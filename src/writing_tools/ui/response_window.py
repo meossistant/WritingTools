@@ -641,6 +641,7 @@ class ResponseWindow(QtWidgets.QWidget):
         helper.setHtml(html_content)
         helper.selectAll()
         helper.copy()
+        helper.deleteLater()
 
     def set_status_notice(self, message: str):
         """Show or hide an informational banner inside the response window."""
@@ -939,4 +940,5 @@ class ResponseWindow(QtWidgets.QWidget):
         if self.app.current_response_window is self:
             self.app.current_response_window = None
 
+        self.deleteLater()
         super().closeEvent(event)

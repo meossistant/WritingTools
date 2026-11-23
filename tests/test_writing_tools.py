@@ -43,7 +43,10 @@ def qapp():
     app = QtWidgets.QApplication.instance()
     if app is None:
         app = QtWidgets.QApplication(["pytest"])
-    return app
+    yield app
+    app.clipboard().clear()
+    app.closeAllWindows()
+    app.processEvents()
 
 
 class DummySignal:
@@ -754,10 +757,11 @@ def test_response_window_diff_toggle_regenerate_original_and_formatted_copy(qapp
 
     # Copy Formatted (#127) populates HTML + clean plain text mime data
     win.copy_latest_formatted()
-    mime = QtWidgets.QApplication.clipboard().mimeData()
-    assert mime.hasHtml()
-    assert "receive" in mime.html()
-    assert mime.text().strip() == "I receive an example."
+    cb = QtWidgets.QApplication.clipboard()
+    assert cb.mimeData().hasHtml()
+    assert "receive" in cb.mimeData().html()
+    assert cb.mimeData().text().strip() == "I receive an example."
+    cb.clear()
 
     # Regenerate button (#148) triggers initial regeneration and removes stale assistant turn
     win.regenerate_latest_response()
@@ -771,5 +775,95 @@ def test_response_window_diff_toggle_regenerate_original_and_formatted_copy(qapp
     assert win.status_banner.text() == "Window focus changed."
 
     win.close()
+
+
+def test_window_context_blacklist_fullscreen_and_app_shortcuts():
+    # Issues #99, #113: terminal auto-shortcuts, custom rules, blacklist & fullscreen pause
+    from writing_tools.window_context import (
+        ActiveWindowInfo,
+        is_window_blacklisted,
+        parse_chord,
+        resolve_copy_paste_chords,
+    )
+
+    kitty = ActiveWindowInfo("0x100", "kitty", "zsh — kitty", is_fullscreen=False)
+    browser = ActiveWindowInfo("0x200", "firefox", "GitHub - Mozilla Firefox", is_fullscreen=False)
+    game = ActiveWindowInfo("0x300", "cs2", "Counter-Strike 2", is_fullscreen=True)
+
+    # Built-in terminal defaults
+    assert resolve_copy_paste_chords(kitty) == ("ctrl+shift+c", "ctrl+shift+v")
+    assert resolve_copy_paste_chords(kitty, enable_terminal_defaults=False) == ("ctrl+c", "ctrl+v")
+    assert resolve_copy_paste_chords(browser) == ("ctrl+c", "ctrl+v")
+
+    # Custom per-app rule overrides defaults
+    custom = "firefox=ctrl+alt+c,ctrl+alt+v\n# comment\nemacs=alt+w,ctrl+y"
+    assert resolve_copy_paste_chords(browser, custom_rules=custom) == ("ctrl+alt+c", "ctrl+alt+v")
+    assert parse_chord("ctrl+shift+c") == (["ctrl", "shift"], "c")
+
+    # Blacklist & fullscreen trigger check
+    assert is_window_blacklisted(game, "cs2, valorant") is True
+    assert is_window_blacklisted(browser, "cs2, *github*") is True
+    assert is_window_blacklisted(kitty, "cs2, valorant") is False
+
+    app = DummyApp()
+    app.paused = False
+    app.config["auto_pause_fullscreen"] = True
+    app.config["app_blacklist"] = "valorant, steam"
+    assert WritingToolApp.should_ignore_trigger(app, active_window=game) is True
+    assert WritingToolApp.should_ignore_trigger(app, active_window=browser) is False
+    app.paused = True
+    assert WritingToolApp.should_ignore_trigger(app, active_window=browser) is True
+
+
+def test_focus_change_safety_opens_response_window_instead_of_pasting(qapp):
+    # Issue #23: if active window changed during LLM call, open ResponseWindow safely
+    from writing_tools.window_context import ActiveWindowInfo
+
+    class _Harness(DummyApp):
+        _hide_loading_indicator = WritingToolApp._hide_loading_indicator
+        show_response_window = WritingToolApp.show_response_window
+        replace_text = WritingToolApp.replace_text
+
+    app = _Harness()
+    app.loading_indicator = None
+    app.output_queue = ""
+    app.config["check_focus_before_paste"] = True
+    app._source_window = ActiveWindowInfo("0x100", "code", "editor.py", False)
+    app._pending_paste_chord = "ctrl+v"
+    app._last_inline_option = "Proofread"
+    app._last_inline_selected_text = "I recieve mail."
+
+    switched_win = ActiveWindowInfo("0x999", "slack", "Slack", False)
+    with patch("writing_tools.app.get_active_window", return_value=switched_win), patch.object(
+        WritingToolApp, "_simulate_key_chord"
+    ) as mock_paste:
+        app.replace_text("I receive mail.")
+        mock_paste.assert_not_called()
+
+    assert app.current_response_window is not None
+    assert app.current_response_window.get_latest_response_text() == "I receive mail."
+    assert "Active window changed" in app.current_response_window.status_banner.text()
+    assert QtWidgets.QApplication.clipboard().text() == "I receive mail."
+    app.current_response_window.close()
+    qapp.processEvents()
+
+
+def test_inline_loading_indicator_non_focus_and_cancel(qapp):
+    # Issues #139, #206: non-focus-stealing floating indicator with cancel callback
+    from PySide6 import QtCore
+    from writing_tools.ui.loading_indicator import InlineLoadingIndicator
+
+    cancelled = []
+    pill = InlineLoadingIndicator(on_cancel=lambda: cancelled.append(True))
+    assert bool(pill.windowFlags() & QtCore.Qt.WindowType.WindowDoesNotAcceptFocus)
+    assert bool(pill.windowFlags() & QtCore.Qt.WindowType.Tool)
+    pill.show_for_action("Proofread")
+    assert pill.isVisible() is True
+    assert "Proofread" in pill.status_label.text()
+    pill.cancel_btn.click()
+    assert cancelled == [True]
+    assert pill.isVisible() is False
+    pill.close()
+
 
 

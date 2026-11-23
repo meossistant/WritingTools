@@ -1,3 +1,4 @@
+import contextlib
 import gettext
 import json
 import logging
@@ -27,11 +28,20 @@ from writing_tools.paths import get_data_dir, get_resource_path
 from writing_tools.ui import (
     about_window,
     custom_popup_window,
+    loading_indicator,
     onboarding_window,
     response_window,
     settings_window,
 )
 from writing_tools.update_checker import UpdateChecker
+from writing_tools.window_context import (
+    DEFAULT_PASTE_CHORD,
+    get_active_window,
+    is_window_blacklisted,
+    parse_chord,
+    resolve_copy_paste_chords,
+    windows_vk_for_key,
+)
 
 _ = gettext.gettext
 
@@ -60,6 +70,8 @@ class WritingToolApp(QtWidgets.QApplication):
     output_ready_signal = Signal(str)
     show_message_signal = Signal(str, str)
     hotkey_triggered_signal = Signal()
+    show_loading_signal = Signal(str)
+    hide_loading_signal = Signal()
 
     def __init__(self, argv):
         super().__init__(argv)
@@ -70,6 +82,8 @@ class WritingToolApp(QtWidgets.QApplication):
         self.output_ready_signal.connect(self.replace_text)
         self.show_message_signal.connect(self.show_message_box)
         self.hotkey_triggered_signal.connect(self.on_hotkey_pressed)
+        self.show_loading_signal.connect(self._show_loading_indicator)
+        self.hide_loading_signal.connect(self._hide_loading_indicator)
 
         self.config = None
         self.config_path = None
@@ -96,6 +110,13 @@ class WritingToolApp(QtWidgets.QApplication):
         self.update_checker = None
         self.current_provider = None
         self._active_request_provider = None
+        self.loading_indicator = None
+
+        # Active window context for focus safety (#23), per-app shortcuts (#99), and blacklist (#113)
+        self._source_window = None
+        self._pending_paste_chord = DEFAULT_PASTE_CHORD
+        self._last_inline_option = "Result"
+        self._last_inline_selected_text = ""
 
         # Holder and generation counter for async Ctrl+C clipboard capture.
         self.current_text_holder = None
@@ -459,8 +480,34 @@ class WritingToolApp(QtWidgets.QApplication):
 
         return callback
 
+    def should_ignore_trigger(self, active_window=None) -> bool:
+        """
+        Check whether a hotkey trigger should be ignored because Writing Tools is
+        paused, the focused app is blacklisted, or auto-pause in fullscreen is active (#113).
+        """
+        if getattr(self, "paused", False):
+            return True
+        cfg = self.config if isinstance(self.config, dict) else {}
+        auto_pause_fs = bool(cfg.get("auto_pause_fullscreen", False))
+        blacklist = cfg.get("app_blacklist", "")
+        if not auto_pause_fs and not blacklist:
+            return False
+
+        info = active_window if active_window is not None else get_active_window()
+        if info is None:
+            return False
+        if auto_pause_fs and info.is_fullscreen:
+            logging.debug(f"Ignoring trigger in fullscreen window: {info.app_name or info.title}")
+            return True
+        if is_window_blacklisted(info, blacklist):
+            logging.debug(f"Ignoring trigger in blacklisted app: {info.app_name or info.title}")
+            return True
+        return False
+
     @Slot(str)
     def _fire_button_directly(self, button_name):
+        if self.should_ignore_trigger():
+            return
         logging.debug(f'Firing button "{button_name}" directly')
 
         if self.popup_window is not None and self.popup_window.isVisible():
@@ -480,6 +527,8 @@ class WritingToolApp(QtWidgets.QApplication):
         logging.debug("Hotkey registered")
 
     def on_hotkey_pressed(self):
+        if self.should_ignore_trigger():
+            return
         logging.debug("Hotkey pressed")
 
         if self.check_trigger_spam():
@@ -576,6 +625,36 @@ class WritingToolApp(QtWidgets.QApplication):
             kbrd.press(target_key)
             kbrd.release(target_key)
 
+    @classmethod
+    def _simulate_key_chord(cls, chord: str):
+        """
+        Safely inject an arbitrary copy/paste shortcut chord such as `ctrl+c`,
+        `ctrl+shift+c`, `alt+w`, or `ctrl+shift+v` (#99).
+        """
+        modifiers, main_key = parse_chord(chord)
+        kbrd = pykeyboard.Controller()
+        cls._release_interfering_modifiers(kbrd)
+
+        mod_keys = []
+        for mod_name in modifiers:
+            key_obj = getattr(pykeyboard.Key, mod_name, None)
+            if key_obj is not None:
+                mod_keys.append(key_obj)
+
+        vk = windows_vk_for_key(main_key)
+        if vk is not None:
+            target_key = cls._platform_shortcut_key(main_key, vk)
+        elif len(main_key) == 1:
+            target_key = main_key
+        else:
+            target_key = getattr(pykeyboard.Key, main_key, main_key)
+
+        with contextlib.ExitStack() as stack:
+            for mk in mod_keys:
+                stack.enter_context(kbrd.pressed(mk))
+            kbrd.press(target_key)
+            kbrd.release(target_key)
+
     @staticmethod
     def _read_clipboard_on_gui_thread() -> str:
         """
@@ -596,9 +675,9 @@ class WritingToolApp(QtWidgets.QApplication):
 
     def _fire_ctrl_c_and_capture_async(self, holder):
         """
-        Inject Ctrl+C while focus is still on the source app, then poll the
-        clipboard in a background thread. Uses a generation counter so rapid
-        consecutive hotkey triggers do not clobber each other's clipboard backup.
+        Capture active window context, resolve per-app copy/paste chords (#99),
+        inject copy while focus is still on the source app, and poll the clipboard
+        in a background thread.
         """
         with self._capture_lock:
             self._capture_generation += 1
@@ -607,12 +686,21 @@ class WritingToolApp(QtWidgets.QApplication):
                 self._clipboard_backup = self._read_clipboard_on_gui_thread()
                 self._capture_active = True
 
+            self._source_window = get_active_window()
+            cfg = self.config if isinstance(self.config, dict) else {}
+            copy_chord, paste_chord = resolve_copy_paste_chords(
+                self._source_window,
+                custom_rules=cfg.get("app_shortcut_rules"),
+                enable_terminal_defaults=bool(cfg.get("enable_terminal_shortcuts", True)),
+            )
+            self._pending_paste_chord = paste_chord
+
             self.clear_clipboard()
 
             try:
-                self._simulate_ctrl_chord("c", 0x43)
+                self._simulate_key_chord(copy_chord)
             except Exception as e:
-                logging.error(f"Error simulating Ctrl+C: {e}")
+                logging.error(f"Error simulating copy chord '{copy_chord}': {e}")
 
         def _poll_clipboard():
             text = ""
@@ -657,12 +745,30 @@ class WritingToolApp(QtWidgets.QApplication):
         except Exception as e:
             logging.error(f"Error clearing clipboard: {e}")
 
+    @Slot(str)
+    def _show_loading_indicator(self, option_name: str):
+        cfg = self.config if isinstance(self.config, dict) else {}
+        if not cfg.get("show_loading_indicator", True):
+            return
+        if self.loading_indicator is None:
+            self.loading_indicator = loading_indicator.InlineLoadingIndicator(
+                on_cancel=self.cancel_active_request
+            )
+        self.loading_indicator.show_for_action(option_name)
+
+    @Slot()
+    def _hide_loading_indicator(self):
+        if self.loading_indicator is not None:
+            self.loading_indicator.hide_indicator()
+
     def cancel_active_request(self):
         """Cancel whichever provider (global or per-button override) is currently running."""
         for provider in {self.current_provider, self._active_request_provider}:
             if provider is not None:
                 provider.cancel()
         self.output_queue = ""
+        if hasattr(self, "hide_loading_signal"):
+            self.hide_loading_signal.emit()
 
     def resolve_provider_for_option(self, option_cfg: dict):
         """
@@ -788,11 +894,17 @@ class WritingToolApp(QtWidgets.QApplication):
                             QtCore.Qt.ConnectionType.QueuedConnection,
                         )
             else:
-                active_provider.get_response(
-                    system_instruction,
-                    prompt,
-                    model_override=model_override,
-                )
+                self._last_inline_option = option
+                self._last_inline_selected_text = selected_text
+                self.show_loading_signal.emit(option)
+                try:
+                    active_provider.get_response(
+                        system_instruction,
+                        prompt,
+                        model_override=model_override,
+                    )
+                finally:
+                    self.hide_loading_signal.emit()
 
         except Exception as e:
             logging.error(f"An error occurred: {e}", exc_info=True)
@@ -820,8 +932,10 @@ class WritingToolApp(QtWidgets.QApplication):
     def replace_text(self, new_text):
         """
         Replaces the selected text by pasting the LLM-generated text.
+        Includes active-window focus verification (#23) and per-app paste chords (#99).
         """
         error_message = "ERROR_TEXT_INCOMPATIBLE_WITH_REQUEST"
+        self._hide_loading_indicator()
 
         if new_text and isinstance(new_text, str):
             self.output_queue += new_text
@@ -842,17 +956,48 @@ class WritingToolApp(QtWidgets.QApplication):
 
             logging.debug("Processing output text")
             try:
+                cleaned_text = self.output_queue.rstrip("\n")
                 if self.current_response_window is not None:
-                    self.current_response_window.set_text(self.output_queue.rstrip("\n"))
+                    self.current_response_window.set_text(cleaned_text)
                 else:
-                    clipboard_backup = self._read_clipboard_on_gui_thread()
-                    cleaned_text = self.output_queue.rstrip("\n")
-                    pyperclip.copy(cleaned_text)
+                    # Focus-change safety check (#23): never paste into the wrong window
+                    cfg = self.config if isinstance(self.config, dict) else {}
+                    focus_changed = False
+                    if cfg.get("check_focus_before_paste", True) and self._source_window is not None:
+                        current_win = get_active_window()
+                        if (
+                            current_win is not None
+                            and current_win.window_id != self._source_window.window_id
+                        ):
+                            focus_changed = True
 
-                    self._simulate_ctrl_chord("v", 0x56)
+                    if focus_changed:
+                        logging.info(
+                            "Active window changed before paste; opening ResponseWindow safely."
+                        )
+                        try:
+                            QtWidgets.QApplication.clipboard().setText(cleaned_text)
+                        except Exception:
+                            pass
+                        win = self.show_response_window(
+                            self._last_inline_option or "Result",
+                            self._last_inline_selected_text or "",
+                        )
+                        win.set_status_notice(
+                            "Active window changed while generating — opened result here and "
+                            "copied it to your clipboard instead of pasting into the wrong app."
+                        )
+                        win.set_text(cleaned_text)
+                        self.current_response_window = win
+                    else:
+                        clipboard_backup = self._read_clipboard_on_gui_thread()
+                        pyperclip.copy(cleaned_text)
 
-                    time.sleep(0.2)
-                    pyperclip.copy(clipboard_backup)
+                        paste_chord = self._pending_paste_chord or DEFAULT_PASTE_CHORD
+                        self._simulate_key_chord(paste_chord)
+
+                        time.sleep(0.2)
+                        pyperclip.copy(clipboard_backup)
 
                 self.output_queue = ""
 
@@ -911,6 +1056,10 @@ class WritingToolApp(QtWidgets.QApplication):
         self.paused = not self.paused
         if self.toggle_action is not None:
             self.toggle_action.setText(self._("Resume") if self.paused else self._("Pause"))
+        if self.tray_icon is not None:
+            self.tray_icon.setToolTip(
+                "WritingTools (Paused)" if self.paused else "WritingTools"
+            )
         logging.debug("App is paused" if self.paused else "App is resumed")
 
     @staticmethod
