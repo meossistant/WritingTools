@@ -231,16 +231,16 @@ def test_openai_pydantic_ai_model_settings_and_headers():
     assert provider._build_model_settings()["temperature"] == 0.5
     assert provider._build_model_settings()["max_tokens"] == 2048
 
-    # Issue #263: Groq & trailing /chat/completions normalization
-    assert (
-        ai_provider.OpenAICompatibleProvider._normalize_base_url("https://api.groq.com/openai")
-        == "https://api.groq.com/openai/v1"
-    )
+    # Generic trailing /chat/completions normalization (no provider-specific hardcoding)
     assert (
         ai_provider.OpenAICompatibleProvider._normalize_base_url(
             "https://api.openai.com/v1/chat/completions"
         )
         == "https://api.openai.com/v1"
+    )
+    assert (
+        ai_provider.OpenAICompatibleProvider._normalize_base_url("https://api.groq.com/openai/v1/")
+        == "https://api.groq.com/openai/v1"
     )
 
     with patch("writing_tools.ai_provider.AsyncOpenAI") as mock_async_openai:

@@ -707,16 +707,14 @@ class OpenAICompatibleProvider(AIProvider):
     @staticmethod
     def _normalize_base_url(raw_url: str) -> Optional[str]:
         """
-        Clean common OpenAI-compatible base URL mistakes (such as trailing
-        `/chat/completions` or Groq's `https://api.groq.com/openai` missing `/v1`).
+        Clean generic OpenAI-compatible base URL copy-paste mistakes
+        (trailing whitespace/slashes or an accidental `/chat/completions` suffix).
         """
         url = (raw_url or "").strip().rstrip("/")
         if not url:
             return None
         if url.endswith("/chat/completions"):
             url = url[: -len("/chat/completions")].rstrip("/")
-        if url.lower() == "https://api.groq.com/openai":
-            url = "https://api.groq.com/openai/v1"
         return url
 
     def _supports_temperature(self) -> bool:
