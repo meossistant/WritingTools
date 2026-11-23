@@ -3,6 +3,7 @@ import logging
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtWidgets import QHBoxLayout, QRadioButton
 
+from writing_tools.autostart import AutostartManager
 from writing_tools.ui.ui_utils import COLOR_MODE, UIUtils
 
 _ = lambda x: x
@@ -18,13 +19,14 @@ class OnboardingWindow(QtWidgets.QWidget):
         self.theme = "gradient"
         self.content_layout = None
         self.shortcut_input = None
+        self.autostart_checkbox = None
         self.self_close = False
         self.init_ui()
 
     def init_ui(self):
         logging.debug("Initializing onboarding UI")
         self.setWindowTitle(_("Welcome to Writing Tools"))
-        self.resize(600, 520)
+        self.resize(600, 560)
 
         UIUtils.setup_window_and_layout(self)
 
@@ -67,14 +69,16 @@ class OnboardingWindow(QtWidgets.QWidget):
         self.content_layout.addWidget(features_label)
 
         shortcut_label = QtWidgets.QLabel(
-            _('Customize your shortcut key (default: "ctrl+space"):')
+            _('Customize your shortcut key (default: "ctrl+space"; double-tap like "ctrl+ctrl" supported):')
         )
         shortcut_label.setStyleSheet(
             f"font-size: 16px; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
         )
+        shortcut_label.setWordWrap(True)
         self.content_layout.addWidget(shortcut_label)
 
         self.shortcut_input = QtWidgets.QLineEdit(self.shortcut)
+        self.shortcut_input.setPlaceholderText("e.g. ctrl+space, ctrl+ctrl, alt+alt")
         self.shortcut_input.setStyleSheet(
             f"""
             font-size: 16px;
@@ -85,6 +89,14 @@ class OnboardingWindow(QtWidgets.QWidget):
         """
         )
         self.content_layout.addWidget(self.shortcut_input)
+
+        if AutostartManager.get_startup_path():
+            self.autostart_checkbox = QtWidgets.QCheckBox(_("Start on Boot"))
+            self.autostart_checkbox.setStyleSheet(
+                f"font-size: 16px; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
+            )
+            self.autostart_checkbox.setChecked(AutostartManager.check_autostart())
+            self.content_layout.addWidget(self.autostart_checkbox)
 
         theme_label = QtWidgets.QLabel(_("Choose your theme:"))
         theme_label.setStyleSheet(
@@ -125,6 +137,8 @@ class OnboardingWindow(QtWidgets.QWidget):
     def on_next_clicked(self, is_gradient):
         self.shortcut = self.shortcut_input.text().strip() or "ctrl+space"
         self.theme = "gradient" if is_gradient else "plain"
+        if self.autostart_checkbox is not None:
+            AutostartManager.set_autostart(self.autostart_checkbox.isChecked())
         logging.debug(f"User selected shortcut: {self.shortcut}, theme: {self.theme}")
         self.app.config = {
             "shortcut": self.shortcut,

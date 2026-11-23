@@ -24,6 +24,11 @@ from writing_tools.ai_provider import (
     OpenAICompatibleProvider,
     obfuscate_api_key,
 )
+from writing_tools.hotkey_listener import (
+    UnifiedHotkeyListener,
+    is_double_tap_hotkey,
+    to_pynput_hotkey,
+)
 from writing_tools.paths import get_data_dir, get_resource_path
 from writing_tools.ui import (
     about_window,
@@ -398,39 +403,64 @@ class WritingToolApp(QtWidgets.QApplication):
         Convert a user-facing hotkey string ('ctrl+j', 'ctrl+alt+space') to
         pynput's `<ctrl>+j` / `<ctrl>+<alt>+<space>` format.
         """
-        parts = [t.strip().lower() for t in hotkey_str.split("+") if t.strip()]
-        return "+".join(t if len(t) <= 1 else f"<{t}>" for t in parts)
+        return to_pynput_hotkey(hotkey_str)
+
+    @staticmethod
+    def compose_system_instruction(base_instruction: str, config: dict | None = None) -> str:
+        """
+        Combine a button/chat system instruction with the user's preferred output
+        language (#48) and global custom rule (#149).
+        """
+        parts = [base_instruction.strip()] if (base_instruction or "").strip() else []
+        cfg = config if isinstance(config, dict) else {}
+
+        output_lang = (cfg.get("output_language") or "").strip()
+        if output_lang and output_lang.lower() != "auto":
+            parts.append(f"Always respond in {output_lang}.")
+
+        global_rule = (cfg.get("global_rule") or "").strip()
+        if global_rule:
+            parts.append(f"Additional user instruction:\n{global_rule}")
+
+        return "\n\n".join(parts)
 
     def start_hotkey_listener(self):
         """
-        Build a single `GlobalHotKeys` listener that handles both the main
-        Writing Tools shortcut AND any per-button direct hotkeys defined in
-        options.json.
+        Build a single unified keyboard listener that handles both standard
+        combinations (`ctrl+space`, `ctrl+shift+p`) AND double-tap modifier
+        hotkeys (`ctrl+ctrl`, `alt+alt`, `shift+shift`) (#248) for both the
+        main Writing Tools shortcut and per-button direct hotkeys.
         """
         try:
             if self.hotkey_listener is not None:
                 self.hotkey_listener.stop()
                 self.hotkey_listener = None
 
-            hotkey_map = {}
+            combo_map = {}
+            double_tap_map = {}
 
             # Global Writing Tools hotkey
             orig_shortcut = (self.config.get("shortcut") or "ctrl+space").strip()
             self.registered_hotkey = orig_shortcut
-            try:
-                global_parsed = self._to_pynput_hotkey(orig_shortcut)
-                pykeyboard.HotKey.parse(global_parsed)
 
-                def on_global_activate():
-                    if self.paused:
-                        return
-                    logging.debug("triggered global hotkey")
-                    self.hotkey_triggered_signal.emit()
+            def on_global_activate():
+                if self.paused:
+                    return
+                logging.debug("triggered global hotkey")
+                self.hotkey_triggered_signal.emit()
 
-                hotkey_map[global_parsed] = on_global_activate
-                logging.debug(f"Registered global hotkey: {global_parsed}")
-            except Exception as e:
-                logging.error(f'Failed to parse global hotkey "{orig_shortcut}": {e}')
+            dt_mod = is_double_tap_hotkey(orig_shortcut)
+            if dt_mod is not None:
+                double_tap_map[dt_mod] = on_global_activate
+                logging.debug(f"Registered global double-tap hotkey: {dt_mod}+{dt_mod}")
+            else:
+                try:
+                    global_parsed = self._to_pynput_hotkey(orig_shortcut)
+                    pykeyboard.HotKey.parse(global_parsed)
+                    combo_map[global_parsed] = on_global_activate
+                    logging.debug(f"Registered global hotkey: {global_parsed}")
+                except Exception as e:
+                    logging.error(f'Failed to parse global hotkey "{orig_shortcut}": {e}')
 
             # Per-button direct hotkeys
             if self.options:
@@ -440,26 +470,41 @@ class WritingToolApp(QtWidgets.QApplication):
                     raw = (button_cfg.get("hotkey") or "").strip()
                     if not raw:
                         continue
+                    btn_dt = is_double_tap_hotkey(raw)
+                    if btn_dt is not None:
+                        if btn_dt in double_tap_map:
+                            logging.warning(
+                                f'Double-tap hotkey "{raw}" for button "{button_name}" '
+                                "conflicts with an already-registered binding; skipping"
+                            )
+                            continue
+                        double_tap_map[btn_dt] = self._make_button_hotkey_callback(button_name)
+                        logging.debug(f"Registered button double-tap hotkey: {btn_dt}+{btn_dt} -> {button_name}")
+                        continue
+
                     try:
                         parsed = self._to_pynput_hotkey(raw)
                         pykeyboard.HotKey.parse(parsed)
                     except Exception as e:
                         logging.error(f'Invalid hotkey "{raw}" for button "{button_name}": {e}')
                         continue
-                    if parsed in hotkey_map:
+                    if parsed in combo_map:
                         logging.warning(
                             f'Hotkey "{raw}" for button "{button_name}" '
                             f"conflicts with an already-registered binding; skipping"
                         )
                         continue
-                    hotkey_map[parsed] = self._make_button_hotkey_callback(button_name)
+                    combo_map[parsed] = self._make_button_hotkey_callback(button_name)
                     logging.debug(f"Registered button hotkey: {parsed} -> {button_name}")
 
-            if not hotkey_map:
+            if not combo_map and not double_tap_map:
                 logging.warning("No hotkeys to register")
                 return
 
-            self.hotkey_listener = pykeyboard.GlobalHotKeys(hotkey_map)
+            if double_tap_map:
+                self.hotkey_listener = UnifiedHotkeyListener(combo_map, double_tap_map)
+            else:
+                self.hotkey_listener = pykeyboard.GlobalHotKeys(combo_map)
             self.hotkey_listener.start()
         except Exception as e:
             logging.error(f"Failed to register hotkey listener: {e}")
@@ -858,7 +903,9 @@ class WritingToolApp(QtWidgets.QApplication):
 
         try:
             prompt_prefix = option_cfg.get("prefix", "")
-            system_instruction = option_cfg.get("instruction", "")
+            system_instruction = self.compose_system_instruction(
+                option_cfg.get("instruction", ""), self.config
+            )
             if getattr(active_provider, "is_non_ai", False):
                 prompt = selected_text
             elif option == "Custom":
@@ -1095,10 +1142,11 @@ class WritingToolApp(QtWidgets.QApplication):
                 if not history or history[-1].get("role") != "user" or history[-1].get("content") != question:
                     history.append({"role": "user", "content": question})
 
-                system_instruction = (
+                system_instruction = self.compose_system_instruction(
                     "You are a helpful AI assistant. Provide clear and direct responses, "
                     "maintaining the same format and style as your previous responses. "
-                    "If appropriate, use Markdown formatting to make your response more readable."
+                    "If appropriate, use Markdown formatting to make your response more readable.",
+                    self.config,
                 )
 
                 active_provider = (
@@ -1164,7 +1212,9 @@ class WritingToolApp(QtWidgets.QApplication):
                     option_cfg = (self.options or {}).get(option, {})
                     selected_text = response_window.selected_text or ""
                     prompt_prefix = option_cfg.get("prefix", "")
-                    system_instruction = option_cfg.get("instruction", "")
+                    system_instruction = self.compose_system_instruction(
+                        option_cfg.get("instruction", ""), self.config
+                    )
                     if getattr(active_provider, "is_non_ai", False):
                         prompt = selected_text
                     elif option == "Custom":
@@ -1203,10 +1253,11 @@ class WritingToolApp(QtWidgets.QApplication):
                         )
                         return
 
-                    system_instruction = (
+                    system_instruction = self.compose_system_instruction(
                         "You are a helpful AI assistant. Provide clear and direct responses, "
                         "maintaining the same format and style as your previous responses. "
-                        "If appropriate, use Markdown formatting to make your response more readable."
+                        "If appropriate, use Markdown formatting to make your response more readable.",
+                        self.config,
                     )
                     response_text = active_provider.get_response(
                         system_instruction,

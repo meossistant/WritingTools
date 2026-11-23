@@ -6,12 +6,37 @@ from PySide6.QtWidgets import QHBoxLayout, QRadioButton, QScrollArea
 
 from writing_tools.ai_provider import AIProvider
 from writing_tools.autostart import AutostartManager
+from writing_tools.hotkey_listener import validate_hotkey
 from writing_tools.paths import get_resource_path
 from writing_tools.ui.ui_utils import COLOR_MODE, UIUtils
 
 _ = lambda x: x
 
 CURRENT_CONFIG_VERSION = 9
+
+_OUTPUT_LANGUAGE_OPTIONS = [
+    ("Auto (Match Input Language)", "auto"),
+    ("English", "English"),
+    ("Vietnamese", "Vietnamese"),
+    ("German", "German"),
+    ("Spanish", "Spanish"),
+    ("French", "French"),
+    ("Italian", "Italian"),
+    ("Japanese", "Japanese"),
+    ("Chinese", "Chinese"),
+    ("Korean", "Korean"),
+]
+_CUSTOM_LANG_SENTINEL = "__custom__"
+_LOCALE_DISPLAY_NAMES = {
+    "en": "English (en)",
+    "it": "Italiano (it)",
+    "vi": "Tiếng Việt (vi)",
+    "de": "Deutsch (de)",
+    "es": "Español (es)",
+    "fr": "Français (fr)",
+    "nl": "Nederlands (nl)",
+    "he": "עברית (he)",
+}
 
 
 class SettingsWindow(QtWidgets.QWidget):
@@ -32,6 +57,16 @@ class SettingsWindow(QtWidgets.QWidget):
         self.provider_container = None
         self.autostart_checkbox = None
         self.shortcut_input = None
+        self.ui_locale_dropdown = None
+        self.output_lang_dropdown = None
+        self.custom_output_lang_input = None
+        self.global_rule_input = None
+        self.check_focus_checkbox = None
+        self.loading_indicator_checkbox = None
+        self.auto_pause_fullscreen_checkbox = None
+        self.terminal_shortcuts_checkbox = None
+        self.app_blacklist_input = None
+        self.app_shortcut_rules_input = None
         self.init_ui()
         self.retranslate_ui()
 
@@ -175,28 +210,33 @@ class SettingsWindow(QtWidgets.QWidget):
                 self.autostart_checkbox.stateChanged.connect(self.toggle_autostart)
                 content_layout.addWidget(self.autostart_checkbox)
 
-            shortcut_label = QtWidgets.QLabel(_("Shortcut Key:"))
-            shortcut_label.setStyleSheet(
-                f"font-size: 16px; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
+            shortcut_label = QtWidgets.QLabel(
+                _("Shortcut Key (supports combos like ctrl+space or double-tap like ctrl+ctrl):")
             )
+            shortcut_label.setStyleSheet(
+                f"font-size: 15px; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
+            )
+            shortcut_label.setWordWrap(True)
             content_layout.addWidget(shortcut_label)
 
-            self.shortcut_input = QtWidgets.QLineEdit(self.app.config.get("shortcut", "ctrl+space"))
-            self.shortcut_input.setStyleSheet(
-                f"""
-                font-size: 16px;
+            input_style = f"""
+                font-size: 15px;
                 padding: 5px;
                 background-color: {'#444' if COLOR_MODE == 'dark' else 'white'};
                 color: {'#ffffff' if COLOR_MODE == 'dark' else '#000000'};
                 border: 1px solid {'#666' if COLOR_MODE == 'dark' else '#ccc'};
             """
+            label_style = (
+                f"font-size: 15px; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
             )
+
+            self.shortcut_input = QtWidgets.QLineEdit(self.app.config.get("shortcut", "ctrl+space"))
+            self.shortcut_input.setPlaceholderText("e.g. ctrl+space, ctrl+ctrl, alt+alt, shift+shift")
+            self.shortcut_input.setStyleSheet(input_style)
             content_layout.addWidget(self.shortcut_input)
 
             theme_label = QtWidgets.QLabel(_("Background Theme:"))
-            theme_label.setStyleSheet(
-                f"font-size: 16px; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
-            )
+            theme_label.setStyleSheet(label_style)
             content_layout.addWidget(theme_label)
 
             theme_layout = QHBoxLayout()
@@ -214,6 +254,159 @@ class SettingsWindow(QtWidgets.QWidget):
             theme_layout.addWidget(self.gradient_radio)
             theme_layout.addWidget(self.plain_radio)
             content_layout.addLayout(theme_layout)
+
+            # UI Language selector (#48)
+            ui_lang_row = QHBoxLayout()
+            ui_lang_label = QtWidgets.QLabel(_("Interface Language:"))
+            ui_lang_label.setStyleSheet(label_style)
+            self.ui_locale_dropdown = QtWidgets.QComboBox()
+            self.ui_locale_dropdown.setStyleSheet(input_style)
+            locales_dir = get_resource_path("locales")
+            available_locales = []
+            if os.path.isdir(locales_dir):
+                for entry in sorted(os.listdir(locales_dir)):
+                    if os.path.isdir(os.path.join(locales_dir, entry)):
+                        available_locales.append(entry)
+            if "en" not in available_locales:
+                available_locales.insert(0, "en")
+            current_locale = self.app.config.get("locale", "en")
+            if current_locale and current_locale not in available_locales:
+                available_locales.append(current_locale)
+            for code in available_locales:
+                self.ui_locale_dropdown.addItem(_LOCALE_DISPLAY_NAMES.get(code, code), code)
+            loc_idx = self.ui_locale_dropdown.findData(current_locale)
+            self.ui_locale_dropdown.setCurrentIndex(loc_idx if loc_idx != -1 else 0)
+            ui_lang_row.addWidget(ui_lang_label)
+            ui_lang_row.addWidget(self.ui_locale_dropdown, 1)
+            content_layout.addLayout(ui_lang_row)
+
+            # Preferred Output Language (#48)
+            out_lang_row = QHBoxLayout()
+            out_lang_label = QtWidgets.QLabel(_("Preferred Output Language:"))
+            out_lang_label.setStyleSheet(label_style)
+            self.output_lang_dropdown = QtWidgets.QComboBox()
+            self.output_lang_dropdown.setStyleSheet(input_style)
+            for disp, val in _OUTPUT_LANGUAGE_OPTIONS:
+                self.output_lang_dropdown.addItem(disp, val)
+            self.output_lang_dropdown.addItem(_("Custom..."), _CUSTOM_LANG_SENTINEL)
+
+            saved_out_lang = (self.app.config.get("output_language") or "auto").strip()
+            out_idx = self.output_lang_dropdown.findData(saved_out_lang)
+            if out_idx != -1:
+                self.output_lang_dropdown.setCurrentIndex(out_idx)
+            else:
+                self.output_lang_dropdown.setCurrentIndex(
+                    self.output_lang_dropdown.findData(_CUSTOM_LANG_SENTINEL)
+                )
+            out_lang_row.addWidget(out_lang_label)
+            out_lang_row.addWidget(self.output_lang_dropdown, 1)
+            content_layout.addLayout(out_lang_row)
+
+            self.custom_output_lang_input = QtWidgets.QLineEdit()
+            self.custom_output_lang_input.setPlaceholderText(
+                _("Enter custom output language (e.g. Portuguese, Polish)")
+            )
+            self.custom_output_lang_input.setStyleSheet(input_style)
+            if out_idx == -1 and saved_out_lang and saved_out_lang != "auto":
+                self.custom_output_lang_input.setText(saved_out_lang)
+            self.custom_output_lang_input.setVisible(
+                self.output_lang_dropdown.currentData() == _CUSTOM_LANG_SENTINEL
+            )
+            self.output_lang_dropdown.currentIndexChanged.connect(
+                lambda: self.custom_output_lang_input.setVisible(
+                    self.output_lang_dropdown.currentData() == _CUSTOM_LANG_SENTINEL
+                )
+            )
+            content_layout.addWidget(self.custom_output_lang_input)
+
+            # Global custom rule (#149)
+            rule_label = QtWidgets.QLabel(_("Global Custom Rule (appended to all AI prompts):"))
+            rule_label.setStyleSheet(label_style)
+            content_layout.addWidget(rule_label)
+
+            self.global_rule_input = QtWidgets.QLineEdit(self.app.config.get("global_rule", ""))
+            self.global_rule_input.setPlaceholderText(
+                _('e.g. "Use British English" or "Keep responses concise and formal"')
+            )
+            self.global_rule_input.setStyleSheet(input_style)
+            content_layout.addWidget(self.global_rule_input)
+
+            # Safety & Behavior section (#23, #139, #113, #99)
+            safety_sep = QtWidgets.QFrame()
+            safety_sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            safety_sep.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+            content_layout.addWidget(safety_sep)
+
+            safety_title = QtWidgets.QLabel(_("Safety, Window Focus & Shortcuts:"))
+            safety_title.setStyleSheet(
+                f"font-size: 16px; font-weight: bold; color: {'#ffffff' if COLOR_MODE == 'dark' else '#333333'};"
+            )
+            content_layout.addWidget(safety_title)
+
+            self.check_focus_checkbox = QtWidgets.QCheckBox(
+                _("Check active window focus before pasting (open window if switched)")
+            )
+            self.check_focus_checkbox.setStyleSheet(label_style)
+            self.check_focus_checkbox.setChecked(
+                bool(self.app.config.get("check_focus_before_paste", True))
+            )
+            content_layout.addWidget(self.check_focus_checkbox)
+
+            self.loading_indicator_checkbox = QtWidgets.QCheckBox(
+                _("Show floating loading indicator during inline replacements")
+            )
+            self.loading_indicator_checkbox.setStyleSheet(label_style)
+            self.loading_indicator_checkbox.setChecked(
+                bool(self.app.config.get("show_loading_indicator", True))
+            )
+            content_layout.addWidget(self.loading_indicator_checkbox)
+
+            self.auto_pause_fullscreen_checkbox = QtWidgets.QCheckBox(
+                _("Auto-pause hotkeys in fullscreen apps (e.g. games)")
+            )
+            self.auto_pause_fullscreen_checkbox.setStyleSheet(label_style)
+            self.auto_pause_fullscreen_checkbox.setChecked(
+                bool(self.app.config.get("auto_pause_fullscreen", False))
+            )
+            content_layout.addWidget(self.auto_pause_fullscreen_checkbox)
+
+            self.terminal_shortcuts_checkbox = QtWidgets.QCheckBox(
+                _("Automatically use Ctrl+Shift+C / V in terminal emulators")
+            )
+            self.terminal_shortcuts_checkbox.setStyleSheet(label_style)
+            self.terminal_shortcuts_checkbox.setChecked(
+                bool(self.app.config.get("enable_terminal_shortcuts", True))
+            )
+            content_layout.addWidget(self.terminal_shortcuts_checkbox)
+
+            bl_label = QtWidgets.QLabel(_("Application Blacklist (comma-separated process/title patterns):"))
+            bl_label.setStyleSheet(label_style)
+            content_layout.addWidget(bl_label)
+
+            self.app_blacklist_input = QtWidgets.QLineEdit(self.app.config.get("app_blacklist", ""))
+            self.app_blacklist_input.setPlaceholderText("e.g. cs2, valorant, dota2")
+            self.app_blacklist_input.setStyleSheet(input_style)
+            content_layout.addWidget(self.app_blacklist_input)
+
+            rules_label = QtWidgets.QLabel(
+                _("Custom Per-App Copy/Paste Rules (one per line: app=copy,paste):")
+            )
+            rules_label.setStyleSheet(label_style)
+            content_layout.addWidget(rules_label)
+
+            self.app_shortcut_rules_input = QtWidgets.QPlainTextEdit()
+            self.app_shortcut_rules_input.setMaximumHeight(68)
+            self.app_shortcut_rules_input.setPlaceholderText("emacs=alt+w,ctrl+y\nkitty=ctrl+shift+c,ctrl+shift+v")
+            self.app_shortcut_rules_input.setPlainText(
+                self.app.config.get("app_shortcut_rules", "")
+            )
+            self.app_shortcut_rules_input.setStyleSheet(input_style)
+            content_layout.addWidget(self.app_shortcut_rules_input)
+
+            provider_sep = QtWidgets.QFrame()
+            provider_sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            provider_sep.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+            content_layout.addWidget(provider_sep)
 
         provider_label = QtWidgets.QLabel(_("Choose AI Provider:"))
         provider_label.setStyleSheet(
@@ -312,8 +505,47 @@ class SettingsWindow(QtWidgets.QWidget):
 
         if not self.providers_only:
             shortcut = self.shortcut_input.text().strip() or "ctrl+space"
+            ok_hk, err_hk = validate_hotkey(shortcut)
+            if not ok_hk:
+                QtWidgets.QMessageBox.warning(self, _("Invalid Shortcut"), err_hk)
+                return
             self.app.config["shortcut"] = shortcut
             self.app.config["theme"] = "gradient" if self.gradient_radio.isChecked() else "plain"
+
+            if self.ui_locale_dropdown is not None:
+                chosen_locale = self.ui_locale_dropdown.currentData() or "en"
+                self.app.config["locale"] = chosen_locale
+                if hasattr(self.app, "change_language"):
+                    self.app.change_language(chosen_locale)
+
+            if self.output_lang_dropdown is not None:
+                out_data = self.output_lang_dropdown.currentData()
+                if out_data == _CUSTOM_LANG_SENTINEL:
+                    out_val = (
+                        self.custom_output_lang_input.text().strip()
+                        if self.custom_output_lang_input
+                        else ""
+                    ) or "auto"
+                else:
+                    out_val = out_data or "auto"
+                self.app.config["output_language"] = out_val
+
+            if self.global_rule_input is not None:
+                self.app.config["global_rule"] = self.global_rule_input.text().strip()
+            if self.check_focus_checkbox is not None:
+                self.app.config["check_focus_before_paste"] = self.check_focus_checkbox.isChecked()
+            if self.loading_indicator_checkbox is not None:
+                self.app.config["show_loading_indicator"] = self.loading_indicator_checkbox.isChecked()
+            if self.auto_pause_fullscreen_checkbox is not None:
+                self.app.config["auto_pause_fullscreen"] = self.auto_pause_fullscreen_checkbox.isChecked()
+            if self.terminal_shortcuts_checkbox is not None:
+                self.app.config["enable_terminal_shortcuts"] = self.terminal_shortcuts_checkbox.isChecked()
+            if self.app_blacklist_input is not None:
+                self.app.config["app_blacklist"] = self.app_blacklist_input.text().strip()
+            if self.app_shortcut_rules_input is not None:
+                self.app.config["app_shortcut_rules"] = (
+                    self.app_shortcut_rules_input.toPlainText().strip()
+                )
         else:
             self.app.create_tray_icon()
 

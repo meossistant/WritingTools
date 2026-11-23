@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from writing_tools.hotkey_listener import validate_hotkey
 from writing_tools.paths import get_data_dir, get_resource_path
 from writing_tools.ui.ui_utils import COLOR_MODE, ThemeBackground
 
@@ -952,13 +953,9 @@ class CustomPopupWindow(QtWidgets.QWidget):
         if not hotkey:
             return True, None
 
-        try:
-            pykeyboard.HotKey.parse(self.app._to_pynput_hotkey(hotkey))
-        except Exception as e:
-            return False, (
-                f"'{hotkey}' isn't a valid hotkey.\n\n"
-                f"Use '+' between keys, e.g. ctrl+j or ctrl+shift+p.\n({e})"
-            )
+        ok, err = validate_hotkey(hotkey)
+        if not ok:
+            return False, err
 
         global_shortcut = (
             (self.app.config.get("shortcut") if self.app.config else None) or "ctrl+space"

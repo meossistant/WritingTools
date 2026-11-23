@@ -38,6 +38,11 @@ from writing_tools.update_checker import CURRENT_VERSION, CURRENT_VERSION_STRING
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_secret_key_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("writing_tools.secrets.get_data_dir", lambda: str(tmp_path))
+
+
 @pytest.fixture(scope="session")
 def qapp():
     app = QtWidgets.QApplication.instance()
@@ -864,6 +869,113 @@ def test_inline_loading_indicator_non_focus_and_cancel(qapp):
     assert cancelled == [True]
     assert pill.isVisible() is False
     pill.close()
+
+
+def test_double_tap_hotkey_state_machine_and_validation():
+    # Issue #248: double-tap modifier hotkeys without false triggers on Ctrl+C / Ctrl+V
+    from writing_tools.hotkey_listener import (
+        DoubleTapTracker,
+        is_double_tap_hotkey,
+        validate_hotkey,
+    )
+
+    assert is_double_tap_hotkey("ctrl+ctrl") == "ctrl"
+    assert is_double_tap_hotkey("Alt + Alt") == "alt"
+    assert is_double_tap_hotkey("shift+shift") == "shift"
+    assert is_double_tap_hotkey("ctrl+space") is None
+    assert validate_hotkey("ctrl+ctrl") == (True, None)
+    assert validate_hotkey("alt+alt") == (True, None)
+
+    fired = []
+    tracker = DoubleTapTracker({"ctrl": lambda: fired.append("ctrl")}, interval=0.40)
+
+    # Clean double-tap within interval -> fires once
+    tracker.on_press("ctrl_l", now=1.00)
+    tracker.on_release("ctrl_l", now=1.05)
+    tracker.on_press("ctrl_l", now=1.20)
+    tracker.on_release("ctrl_l", now=1.25)
+    assert fired == ["ctrl"]
+
+    # Rapid Ctrl+C then Ctrl+V must NEVER false-trigger double-tap Ctrl
+    fired.clear()
+    tracker.on_press("ctrl_l", now=2.00)
+    tracker.on_press("c", now=2.02)
+    tracker.on_release("c", now=2.04)
+    tracker.on_release("ctrl_l", now=2.06)
+    tracker.on_press("ctrl_l", now=2.12)
+    tracker.on_press("v", now=2.14)
+    tracker.on_release("v", now=2.16)
+    tracker.on_release("ctrl_l", now=2.18)
+    assert fired == []
+
+    # Clean first tap followed by Ctrl+V must NOT fire
+    tracker.on_press("ctrl_l", now=3.00)
+    tracker.on_release("ctrl_l", now=3.05)
+    tracker.on_press("ctrl_l", now=3.15)
+    tracker.on_press("v", now=3.17)
+    tracker.on_release("v", now=3.19)
+    tracker.on_release("ctrl_l", now=3.21)
+    assert fired == []
+
+    # Too slow (> 0.40s between taps) -> does not fire
+    tracker.on_press("ctrl_l", now=4.00)
+    tracker.on_release("ctrl_l", now=4.05)
+    tracker.on_press("ctrl_l", now=4.60)
+    tracker.on_release("ctrl_l", now=4.65)
+    assert fired == []
+
+
+def test_global_rule_output_language_and_settings_onboarding_roundtrip(qapp):
+    # Issues #149, #48, #206: global custom rule, output/UI language, safety toggles, onboarding autostart
+    composed = WritingToolApp.compose_system_instruction(
+        "Fix grammar.",
+        {"output_language": "Vietnamese", "global_rule": "Use polite formal tone."},
+    )
+    assert "Fix grammar." in composed
+    assert "Always respond in Vietnamese." in composed
+    assert "Use polite formal tone." in composed
+
+    auto_only = WritingToolApp.compose_system_instruction(
+        "Fix grammar.",
+        {"output_language": "auto", "global_rule": ""},
+    )
+    assert auto_only == "Fix grammar."
+
+    app = DummyApp()
+    gemini = ai_provider.GeminiProvider(app)
+    app.providers = [gemini]
+    app.config["provider"] = gemini.provider_name
+    win = SettingsWindow(app, providers_only=False)
+    win.shortcut_input.setText("ctrl+ctrl")
+    idx_vi = win.output_lang_dropdown.findData("Vietnamese")
+    assert idx_vi != -1
+    win.output_lang_dropdown.setCurrentIndex(idx_vi)
+    win.global_rule_input.setText("Always use concise sentences.")
+    win.check_focus_checkbox.setChecked(True)
+    win.loading_indicator_checkbox.setChecked(True)
+    win.auto_pause_fullscreen_checkbox.setChecked(True)
+    win.terminal_shortcuts_checkbox.setChecked(True)
+    win.app_blacklist_input.setText("cs2, valorant")
+    win.app_shortcut_rules_input.setPlainText("emacs=alt+w,ctrl+y")
+
+    win.save_settings()
+    assert app.config["shortcut"] == "ctrl+ctrl"
+    assert app.config["output_language"] == "Vietnamese"
+    assert app.config["global_rule"] == "Always use concise sentences."
+    assert app.config["check_focus_before_paste"] is True
+    assert app.config["show_loading_indicator"] is True
+    assert app.config["auto_pause_fullscreen"] is True
+    assert app.config["enable_terminal_shortcuts"] is True
+    assert app.config["app_blacklist"] == "cs2, valorant"
+    assert app.config["app_shortcut_rules"] == "emacs=alt+w,ctrl+y"
+    win.close()
+
+    onboarding = OnboardingWindow(app)
+    if AutostartManager.get_startup_path():
+        assert onboarding.autostart_checkbox is not None
+    onboarding.self_close = True
+    onboarding.close()
+
 
 
 
