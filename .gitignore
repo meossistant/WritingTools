@@ -1,13 +1,11 @@
-# macOS system files
-
-.DS_Store
-Windows_and_Linux/config.json
-
-.idea
-**/__pycache__
+config.json
+.idea/
+.venv/
+**/.venv/
+**/__pycache__/
 **/*.mo
-**/pot_files
-
-# Xcode user-specific data
-**/xcuserdata/
-**/project.xcworkspace/xcuserdata/
+pot_files/
+dist/
+build/
+*.spec
+.pytest_cache/

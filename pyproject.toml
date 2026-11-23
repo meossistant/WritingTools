@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "writing-tools"
+version = "9.0.0"
+description = "System-wide AI writing assistant for Windows and Linux"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "darkdetect>=0.8.0",
+    "markdown2>=2.5.5",
+    "pydantic-ai-slim[google,openai]>=2.71.0",
+    "pynput>=1.8.2",
+    "pyperclip>=1.11.0",
+    "PySide6>=6.12.0",
+]
+
+[project.scripts]
+writing-tools = "writing_tools.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+]
+build = [
+    "pyinstaller>=6.22.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/writing_tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
