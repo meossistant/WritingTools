@@ -10,9 +10,13 @@ message history translation, and model settings across all supported AI provider
 
 import base64
 import binascii
+import json
 import logging
 import re
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
@@ -858,3 +862,254 @@ class LlamaCppProvider(AIProvider):
         except Exception as e:
             logging.error(f"Failed to initialize Pydantic AI llama.cpp model: {e}")
             return None
+
+
+class LanguageToolProvider(AIProvider):
+    """
+    Non-AI offline/self-hosted spelling and grammar checker connecting to an
+    external LanguageTool HTTP server (`POST /v2/check`). Requires zero extra
+    Python dependencies and zero bundled Java runtime in Writing Tools.
+    """
+
+    is_non_ai = True
+
+    def __init__(self, app):
+        self.api_base = "http://127.0.0.1:8010"
+        self.language = "auto"
+        self.level = "default"
+        self.username = ""
+        self.api_key = ""
+
+        settings = [
+            TextSetting(
+                "api_base",
+                "Server URL",
+                "http://127.0.0.1:8010",
+                "E.g. http://127.0.0.1:8010",
+            ),
+            DropdownSetting(
+                name="language",
+                display_name="Language",
+                default_value="auto",
+                description="Language code for LanguageTool (auto detects 30+ languages)",
+                options=[
+                    ("Auto-detect (30+ languages)", "auto"),
+                    ("English (US)", "en-US"),
+                    ("English (UK)", "en-GB"),
+                    ("German (DE)", "de-DE"),
+                    ("French", "fr"),
+                    ("Spanish", "es"),
+                    ("Italian", "it"),
+                    ("Portuguese (BR)", "pt-BR"),
+                    ("Dutch", "nl"),
+                ],
+                allow_custom=True,
+                custom_placeholder="e.g., en-AU, pl-PL, uk-UA, ja-JP",
+            ),
+            DropdownSetting(
+                name="level",
+                display_name="Checking Level",
+                default_value="default",
+                description="Standard spelling/grammar or Picky style rules",
+                options=[
+                    ("Standard (spelling & grammar)", "default"),
+                    ("Picky (includes style rules)", "picky"),
+                ],
+            ),
+            TextSetting(
+                "username",
+                "Username (Optional)",
+                "",
+                "Only needed for authenticated / Premium LanguageTool servers",
+            ),
+            TextSetting(
+                name="api_key",
+                display_name="API Key (Optional)",
+                default_value="",
+                description="Only needed for authenticated / Premium LanguageTool servers",
+                is_secret=True,
+            ),
+        ]
+        super().__init__(
+            app,
+            "LanguageTool (External Server)",
+            settings,
+            "• Non-AI offline/self-hosted grammar & spelling checker via an external LanguageTool HTTP server.\n"
+            "• Docker quick start: docker run -d -p 8010:8010 erikvl87/languagetool",
+            "languagetool",
+            "LanguageTool Server Docs",
+            lambda: webbrowser.open("https://dev.languagetool.org/http-server"),
+        )
+
+    @staticmethod
+    def _normalize_check_url(raw_url: str) -> str:
+        """
+        Normalize user-supplied LanguageTool server URL to the `/v2/check` endpoint.
+        Accepts `http://127.0.0.1:8010`, `.../v2`, or `.../v2/check`.
+        """
+        url = (raw_url or "http://127.0.0.1:8010").strip().rstrip("/")
+        if url.endswith("/v2/check"):
+            return url
+        if url.endswith("/v2"):
+            return f"{url}/check"
+        return f"{url}/v2/check"
+
+    @staticmethod
+    def _extract_input_text(prompt: str | list) -> str:
+        """Extract raw text from either a plain string or chat message list."""
+        if isinstance(prompt, list):
+            for msg in reversed(prompt):
+                if msg.get("role") == "user":
+                    return str(msg.get("content", ""))
+            return ""
+        return str(prompt or "")
+
+    @staticmethod
+    def apply_matches(text: str, matches: list[dict]) -> str:
+        """
+        Apply top LanguageTool replacements safely without offset drift or
+        corrupting overlapping spans.
+        """
+        if not text or not matches:
+            return text
+
+        valid = []
+        for m in matches:
+            offset = m.get("offset")
+            length = m.get("length")
+            replacements = m.get("replacements") or []
+            if (
+                isinstance(offset, int)
+                and isinstance(length, int)
+                and offset >= 0
+                and length >= 0
+                and offset + length <= len(text)
+                and replacements
+                and "value" in replacements[0]
+            ):
+                valid.append((offset, length, str(replacements[0]["value"])))
+
+        # Sort left-to-right (preferring longer match on identical offset) and drop overlaps
+        valid.sort(key=lambda item: (item[0], -item[1]))
+        non_overlapping = []
+        last_end = -1
+        for offset, length, replacement in valid:
+            if offset < last_end:
+                continue
+            non_overlapping.append((offset, length, replacement))
+            last_end = offset + length
+
+        # Apply right-to-left so earlier offsets remain exact
+        result = text
+        for offset, length, replacement in reversed(non_overlapping):
+            result = result[:offset] + replacement + result[offset + length :]
+        return result
+
+    @classmethod
+    def format_report(
+        cls, text: str, matches: list[dict], detected_language: Optional[str] = None
+    ) -> str:
+        """Format a Markdown diagnostic report + corrected text for window display."""
+        corrected = cls.apply_matches(text, matches)
+        header = "### LanguageTool Proofread"
+        if detected_language:
+            header += f" ({detected_language})"
+
+        if not matches:
+            return f"{header}\n\nNo spelling or grammar issues found.\n\n{text}"
+
+        lines = [header, "", "**Corrected Text**", "", corrected, "", f"**Issues Found ({len(matches)})**", ""]
+        for m in matches:
+            offset = m.get("offset", 0)
+            length = m.get("length", 0)
+            original = text[offset : offset + length] if isinstance(offset, int) and isinstance(length, int) else ""
+            repls = [r.get("value", "") for r in (m.get("replacements") or [])[:3] if r.get("value")]
+            rule_id = (m.get("rule") or {}).get("id", "RULE")
+            message = m.get("message", "Issue detected")
+            suggestion = f" -> `{', '.join(repls)}`" if repls else ""
+            excerpt = f"`{original}`" if original else "(insertion)"
+            lines.append(f"- {excerpt}{suggestion} — {message} (`{rule_id}`)")
+        return "\n".join(lines)
+
+    def _build_model(self) -> Optional[Model]:
+        # LanguageTool is a non-AI REST server rather than a Pydantic AI LLM model
+        return None
+
+    def get_response(
+        self, system_instruction: str, prompt: str | list, return_response: bool = False
+    ) -> str:
+        """
+        Send text to the configured external LanguageTool `/v2/check` endpoint.
+        In inline mode, applies top suggestions and emits corrected text;
+        in window mode, returns a Markdown report with corrected text and diagnostics.
+        """
+        self.close_requested = False
+        self._cancel_event.clear()
+
+        text = self._extract_input_text(prompt)
+        if not text.strip():
+            return ""
+
+        check_url = self._normalize_check_url(self.api_base)
+        payload = {
+            "text": text,
+            "language": (self.language or "auto").strip() or "auto",
+            "level": (self.level or "default").strip() or "default",
+        }
+        if (self.username or "").strip():
+            payload["username"] = self.username.strip()
+        if (self.api_key or "").strip():
+            payload["apiKey"] = self.api_key.strip()
+
+        encoded = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(
+            check_url,
+            data=encoded,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            if self._cancel_event.is_set():
+                logging.debug("LanguageTool request was cancelled; discarding response.")
+                return ""
+
+            matches = data.get("matches") or []
+            detected = (data.get("language") or {}).get("detectedLanguage", {}).get("name") or (
+                data.get("language") or {}
+            ).get("name")
+
+            if return_response or self.app.current_response_window is not None:
+                return self.format_report(text, matches, detected_language=detected)
+
+            corrected = self.apply_matches(text, matches)
+            self.app.output_ready_signal.emit(corrected)
+            return ""
+        except urllib.error.URLError as e:
+            if self._cancel_event.is_set():
+                return ""
+            logging.error(f"Failed to connect to LanguageTool server at {check_url}: {e}")
+            self.app.show_message_signal.emit(
+                "LanguageTool Server Unreachable",
+                f"Could not connect to LanguageTool at {check_url}.\n\n"
+                "Make sure your external LanguageTool server is running "
+                "(e.g., `docker run -d -p 8010:8010 erikvl87/languagetool`).",
+            )
+            return ""
+        except Exception as e:
+            if self._cancel_event.is_set():
+                return ""
+            logging.error(f"Error in LanguageToolProvider: {e}")
+            self.app.show_message_signal.emit(
+                "LanguageTool Error",
+                f"An error occurred while contacting LanguageTool:\n{e}",
+            )
+            return ""
+        finally:
+            self.close_requested = False

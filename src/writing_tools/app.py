@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from writing_tools.ai_provider import (
     GeminiProvider,
+    LanguageToolProvider,
     LlamaCppProvider,
     OpenAICompatibleProvider,
     obfuscate_api_key,
@@ -107,11 +108,12 @@ class WritingToolApp(QtWidgets.QApplication):
         self.ctrl_c_timer = None
         self.setup_ctrl_c_listener()
 
-        # Setup available AI providers
+        # Setup available AI & proofreading providers
         self.providers = [
             GeminiProvider(self),
             OpenAICompatibleProvider(self),
             LlamaCppProvider(self),
+            LanguageToolProvider(self),
         ]
 
         if not self.config:
@@ -712,7 +714,9 @@ class WritingToolApp(QtWidgets.QApplication):
         try:
             prompt_prefix = option_cfg.get("prefix", "")
             system_instruction = option_cfg.get("instruction", "")
-            if option == "Custom":
+            if getattr(self.current_provider, "is_non_ai", False):
+                prompt = selected_text
+            elif option == "Custom":
                 prompt = f"{prompt_prefix}Described change: {custom_change}\n\nText: {selected_text}"
             else:
                 prompt = f"{prompt_prefix}{selected_text}"

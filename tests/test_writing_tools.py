@@ -521,3 +521,67 @@ def test_popup_window_has_tool_flag_no_taskbar_entry(qapp, tmp_path, monkeypatch
     popup = CustomPopupWindow(app)
     assert bool(popup.windowFlags() & QtCore.Qt.WindowType.Tool)
     popup.close()
+
+
+def test_languagetool_external_server_provider():
+    import urllib.error
+
+    app = DummyApp()
+    provider = ai_provider.LanguageToolProvider(app)
+    assert provider.is_non_ai is True
+    assert provider.provider_name == "LanguageTool (External Server)"
+
+    # URL normalization
+    assert provider._normalize_check_url("http://127.0.0.1:8010") == "http://127.0.0.1:8010/v2/check"
+    assert provider._normalize_check_url("http://127.0.0.1:8010/v2/") == "http://127.0.0.1:8010/v2/check"
+    assert provider._normalize_check_url("http://127.0.0.1:8010/v2/check") == "http://127.0.0.1:8010/v2/check"
+
+    # Non-overlapping reverse-offset replacement application
+    sample = "I recieve an exampel."
+    matches = [
+        {"offset": 2, "length": 7, "replacements": [{"value": "receive"}], "message": "Typo", "rule": {"id": "SPELL"}},
+        # Overlapping span that must be skipped
+        {"offset": 3, "length": 4, "replacements": [{"value": "XXXX"}], "message": "Overlap", "rule": {"id": "OVERLAP"}},
+        {"offset": 13, "length": 7, "replacements": [{"value": "example"}], "message": "Typo", "rule": {"id": "SPELL"}},
+    ]
+    assert provider.apply_matches(sample, matches) == "I receive an example."
+
+    # Mocked HTTP POST /v2/check — inline mode emits corrected text
+    fake_payload = json.dumps({
+        "language": {"detectedLanguage": {"name": "English (US)"}},
+        "matches": [matches[0], matches[2]],
+    }).encode("utf-8")
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return fake_payload
+
+    provider.load_config({"api_base": "http://127.0.0.1:8010", "language": "auto", "level": "default"})
+    with patch("writing_tools.ai_provider.urllib.request.urlopen", return_value=_FakeResp()):
+        res = provider.get_response("ignored", sample, return_response=False)
+        assert res == ""
+        assert app.output_ready_signal.emissions == [("I receive an example.",)]
+
+        # Window mode returns formatted Markdown report
+        report = provider.get_response("ignored", sample, return_response=True)
+        assert "I receive an example." in report
+        assert "Issues Found (2)" in report
+        assert "English (US)" in report
+
+    # Connection error routes cleanly to show_message_signal (never overwrites text)
+    app.output_ready_signal.emissions.clear()
+    app.show_message_signal.emissions.clear()
+    with patch(
+        "writing_tools.ai_provider.urllib.request.urlopen",
+        side_effect=urllib.error.URLError("Connection refused"),
+    ):
+        assert provider.get_response("ignored", sample, return_response=False) == ""
+        assert len(app.output_ready_signal.emissions) == 0
+        assert len(app.show_message_signal.emissions) == 1
+        assert "Unreachable" in app.show_message_signal.emissions[0][0]

@@ -8,6 +8,7 @@
 - **`uv` Package Management**: Replaced unpinned `requirements.txt` with PEP 621 `pyproject.toml` (`hatchling`), `.python-version` (`3.12`), and deterministic `uv.lock`, with `dev` and `build` dependency groups and `uv run writing-tools`.
 - **Pydantic AI Provider Layer**: Refactored all AI providers onto `pydantic-ai-slim[google,openai]>=2.71.0` (`model_request_sync`, `ModelRequest`/`ModelResponse`, typed `ModelSettings`), removing provider-specific chat history branching.
 - **`llama.cpp` + Gemma 4 E2B IT**: Replaced Ollama with native `llama.cpp` (`llama-server`) support defaulting to `gemma-4-E2B-it` (with `ggml-org/gemma-4-E2B-it-GGUF:Q4_K_M` and `gemma-4-E4B-it` presets).
+- **Non-AI Offline Proofreading via External LanguageTool Server**: Added zero-dependency `LanguageToolProvider` (`POST /v2/check`) supporting self-hosted/Docker LanguageTool servers across 30+ languages without bundling Java or heavy JARs into Writing Tools.
 - **Updated Dependencies & Models**: Upgraded to `PySide6>=6.12.0`, `pydantic-ai-slim>=2.71.0`, `markdown2>=2.5.5`, `pynput>=1.8.2`, `pyperclip>=1.11.0`, `darkdetect>=0.8.0`; updated Gemini (`gemini-flash-latest`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-4-hydrogen`, `gemini-4-neon`, `gemma-4-*`) and OpenAI (`gpt-6-luna`, `gpt-5.4-mini`, `gpt-4.1-mini`) presets.
 - **PEP 8 & Standard `src/` Restructuring**: Flattened `Windows_and_Linux/` into `src/writing_tools/`, standardized `snake_case` modules/scripts/resources and kebab-case `docs/`, and added `tests/test_writing_tools.py` (18 automated tests).
 - **GitHub Actions CI & Builds**: Added automated CI testing (`ubuntu-latest` + `windows-latest`) and PyInstaller executable builds/releases in `.github/workflows/`.
@@ -166,6 +167,27 @@ Run Writing Tools completely offline and privately using `llama.cpp`'s built-in 
    - **Model**: `gemma-4-E2B-it` (default; or select `ggml-org/gemma-4-E2B-it-GGUF:Q4_K_M` / `gemma-4-E4B-it` / Custom)
    - **API Key**: Leave blank unless you started `llama-server` with `--api-key`
 4. Save Settings and enjoy Writing Tools locally with zero cloud dependency.
+
+<a id="languagetool-server-instructions"></a>
+## (Optional) External LanguageTool Server (Non-AI Offline Proofreading)
+
+If you want deterministic, non-AI spelling and grammar checking across 30+ languages without bundling Java (~650 MB disk / ~800 MB RAM) into Writing Tools, connect to an external LanguageTool HTTP server:
+
+1. Start a local or LAN LanguageTool server:
+   - **Docker (recommended):**
+     ```bash
+     docker run -d --name languagetool -p 8010:8010 erikvl87/languagetool
+     ```
+   - **Standalone Java (Java 17+):**
+     ```bash
+     java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 8010 --allow-origin
+     ```
+2. Open Writing Tools Settings and select **`LanguageTool (External Server)`**.
+   - **Server URL**: `http://127.0.0.1:8010` (automatically normalized to `/v2/check`)
+   - **Language**: `auto` (default, 30+ languages) or any specific code (`en-US`, `de-DE`, `fr`, etc.)
+   - **Checking Level**: `default` (spelling & grammar) or `picky` (includes style rules)
+   - **Username / API Key**: Leave blank for self-hosted servers
+3. Inline options (e.g., **Proofread**) apply top corrections directly; window options display a formatted Markdown diagnostic report alongside the corrected text.
 
 ## 🐞 Known Issues
 1. Some reported hotkey conflicts on the latest v9 build: will release a maintenance update when I get time!

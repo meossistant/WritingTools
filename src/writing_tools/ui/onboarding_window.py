@@ -56,6 +56,7 @@ class OnboardingWindow(QtWidgets.QWidget):
             - {_('Google Gemini (Gemini Flash Latest, Gemini 3.8 Flash, Gemini 4) & Gemma 4')}
             - {_('ANY OpenAI-Compatible API (GPT-6, GPT-5.4, OpenRouter, vLLM, etc.)')}
             - {_('Local LLMs via llama.cpp (Gemma 4 E2B IT, etc.)')}
+            - {_('Non-AI offline proofreading via external LanguageTool server')}
         """
         features_label = QtWidgets.QLabel(features_text)
         features_label.setStyleSheet(
