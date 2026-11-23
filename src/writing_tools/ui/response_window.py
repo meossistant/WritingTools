@@ -378,7 +378,7 @@ class ResponseWindow(QtWidgets.QWidget):
 
         copy_md_btn = QtWidgets.QPushButton(_("Copy as Markdown"))
         copy_md_btn.setStyleSheet(self.get_button_style())
-        copy_md_btn.clicked.connect(self.copy_first_response)
+        copy_md_btn.clicked.connect(self.copy_latest_response)
         copy_bar.addWidget(copy_md_btn)
         content_layout.addLayout(copy_bar)
 
@@ -472,8 +472,25 @@ class ResponseWindow(QtWidgets.QWidget):
             logging.error(f"Error getting first response: {e}")
             return None
 
+    def get_latest_response_text(self):
+        """Return the most recent assistant response in the conversation."""
+        try:
+            for msg in reversed(self.chat_history):
+                if msg.get("role") == "assistant":
+                    return msg.get("content")
+            return None
+        except Exception as e:
+            logging.error(f"Error getting latest response: {e}")
+            return None
+
     def copy_first_response(self):
         response_text = self.get_first_response_text()
+        if response_text:
+            QtWidgets.QApplication.clipboard().setText(response_text)
+
+    def copy_latest_response(self):
+        """Copy the latest AI response as Markdown (fixing follow-up copy behavior)."""
+        response_text = self.get_latest_response_text()
         if response_text:
             QtWidgets.QApplication.clipboard().setText(response_text)
 

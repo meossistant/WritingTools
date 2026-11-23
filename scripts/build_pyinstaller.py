@@ -31,6 +31,10 @@ def run_pyinstaller_build() -> None:
         "--paths", os.path.join(ROOT_DIR, "src"),
         # Bundle runtime resources inside writing_tools/resources
         "--add-data", _add_data_arg(RESOURCES_DIR, os.path.join("writing_tools", "resources")),
+        # Ensure dynamic tokenizer encodings and CA certs are bundled in frozen builds
+        "--hidden-import", "tiktoken_ext.openai_public",
+        "--hidden-import", "tiktoken_ext",
+        "--collect-data", "certifi",
         # Exclude unnecessary modules
         "--exclude-module", "tkinter",
         "--exclude-module", "unittest",

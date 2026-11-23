@@ -1,4 +1,29 @@
-# Writing Tools
+# Writing Tools (Modernized Windows & Linux Fork)
+
+> **Fork Disclosure:** This repository (`meossistant/WritingTools`) is a modernized, Windows & Linux-focused fork of [`theJayTea/WritingTools`](https://github.com/theJayTea/WritingTools) (branched from commit `0839d8c` / `Win_v9`), authored with **Gemini 4 Neon** via **Antigravity**. See [CHANGELOG.md](CHANGELOG.md) for the complete version history.
+
+## What Changed in This Fork
+
+- **macOS Components Stripped**: Removed the `macOS/` Swift/Xcode port (115 files) and macOS-specific docs/references to focus exclusively on Windows and Linux.
+- **`uv` Package Management**: Replaced unpinned `requirements.txt` with PEP 621 `pyproject.toml` (`hatchling`), `.python-version` (`3.12`), and deterministic `uv.lock`, with `dev` and `build` dependency groups and `uv run writing-tools`.
+- **Pydantic AI Provider Layer**: Refactored all AI providers onto `pydantic-ai-slim[google,openai]>=2.71.0` (`model_request_sync`, `ModelRequest`/`ModelResponse`, typed `ModelSettings`), removing provider-specific chat history branching.
+- **`llama.cpp` + Gemma 4 E2B IT**: Replaced Ollama with native `llama.cpp` (`llama-server`) support defaulting to `gemma-4-E2B-it` (with `ggml-org/gemma-4-E2B-it-GGUF:Q4_K_M` and `gemma-4-E4B-it` presets).
+- **Updated Dependencies & Models**: Upgraded to `PySide6>=6.12.0`, `pydantic-ai-slim>=2.71.0`, `markdown2>=2.5.5`, `pynput>=1.8.2`, `pyperclip>=1.11.0`, `darkdetect>=0.8.0`; updated Gemini (`gemini-flash-latest`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-4-hydrogen`, `gemini-4-neon`, `gemma-4-*`) and OpenAI (`gpt-6-luna`, `gpt-5.4-mini`, `gpt-4.1-mini`) presets.
+- **PEP 8 & Standard `src/` Restructuring**: Flattened `Windows_and_Linux/` into `src/writing_tools/`, standardized `snake_case` modules/scripts/resources and kebab-case `docs/`, and added `tests/test_writing_tools.py` (18 automated tests).
+- **GitHub Actions CI & Builds**: Added automated CI testing (`ubuntu-latest` + `windows-latest`) and PyInstaller executable builds/releases in `.github/workflows/`.
+- **Code Audit & Upstream Windows/Linux Issue Fixes**:
+  - Fixed Linux X11 permanent clipboard deadlock when pressing a hotkey after copying from `ResponseWindow` ([theJayTea/WritingTools#288](https://github.com/theJayTea/WritingTools/issues/288)).
+  - Fixed Gemini `thinking_level="minimal"` HTTP 400 errors on `gemini-flash-latest` (`gemini-3.8-flash`), Gemini 4, and Pro models, plus Gemini thinking model output issues ([theJayTea/WritingTools#282](https://github.com/theJayTea/WritingTools/issues/282), [#189](https://github.com/theJayTea/WritingTools/issues/189)).
+  - Fixed non-Latin keyboard layout `Ctrl+C`/`Ctrl+V` failures on Windows using virtual key codes `0x43`/`0x56` ([theJayTea/WritingTools#270](https://github.com/theJayTea/WritingTools/issues/270), [#275](https://github.com/theJayTea/WritingTools/issues/275)).
+  - Fixed held modifier interference (`Alt`/`Win`/`Shift`) causing `₢` insertion, Windows color filter inversion (`Ctrl+Win+C`), or typing `c` over selected text ([theJayTea/WritingTools#195](https://github.com/theJayTea/WritingTools/issues/195), [#185](https://github.com/theJayTea/WritingTools/issues/185), [#183](https://github.com/theJayTea/WritingTools/issues/183)).
+  - Fixed "Copy as Markdown" copying only the first response instead of the latest follow-up response ([theJayTea/WritingTools#249](https://github.com/theJayTea/WritingTools/issues/249), [#170](https://github.com/theJayTea/WritingTools/issues/170)).
+  - Added single-instance enforcement via Qt `QLockFile` ([theJayTea/WritingTools#233](https://github.com/theJayTea/WritingTools/issues/233)).
+  - Added configurable `Max Output Tokens` across all providers ([theJayTea/WritingTools#220](https://github.com/theJayTea/WritingTools/issues/220)).
+  - Added `<think>...</think>` tag stripping for reasoning models like DeepSeek R1 / QwQ ([theJayTea/WritingTools#109](https://github.com/theJayTea/WritingTools/issues/109)).
+  - Masked API key fields with Show/Hide toggle and fixed Settings key deobfuscation ([theJayTea/WritingTools#251](https://github.com/theJayTea/WritingTools/issues/251)).
+  - Fixed stale update banner on v9 ([theJayTea/WritingTools#268](https://github.com/theJayTea/WritingTools/issues/268), [#270](https://github.com/theJayTea/WritingTools/issues/270)), Groq/OpenAI base URL normalization ([theJayTea/WritingTools#263](https://github.com/theJayTea/WritingTools/issues/263)), Start Menu / autostart path resolution + Linux XDG autostart ([theJayTea/WritingTools#150](https://github.com/theJayTea/WritingTools/issues/150)), newer model presets & legacy Gemini 2.0 migration ([theJayTea/WritingTools#289](https://github.com/theJayTea/WritingTools/issues/289), [#153](https://github.com/theJayTea/WritingTools/issues/153)), tray icon click to open popup ([theJayTea/WritingTools#83](https://github.com/theJayTea/WritingTools/issues/83)), popup taskbar icon hiding ([theJayTea/WritingTools#142](https://github.com/theJayTea/WritingTools/issues/142)), PySide6 6.12 `.exec()` / scoped enums, provider error safety, cancellation, and live button/hotkey reload.
+
+---
 
 ### **Instantly proofread and optimize your writing system-wide with AI:**
 

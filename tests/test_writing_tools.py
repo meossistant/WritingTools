@@ -223,10 +223,25 @@ def test_openai_pydantic_ai_model_settings_and_headers():
     })
     assert isinstance(provider.model, OpenAIChatModel)
     assert provider.model.model_name == "gpt-6-luna"
-    assert provider._build_model_settings() is None
+    assert "temperature" not in provider._build_model_settings()
+    assert provider._build_model_settings()["max_tokens"] == 8192
 
     provider.api_model = "gpt-4.1-mini"
+    provider.max_tokens = "2048"
     assert provider._build_model_settings()["temperature"] == 0.5
+    assert provider._build_model_settings()["max_tokens"] == 2048
+
+    # Issue #263: Groq & trailing /chat/completions normalization
+    assert (
+        ai_provider.OpenAICompatibleProvider._normalize_base_url("https://api.groq.com/openai")
+        == "https://api.groq.com/openai/v1"
+    )
+    assert (
+        ai_provider.OpenAICompatibleProvider._normalize_base_url(
+            "https://api.openai.com/v1/chat/completions"
+        )
+        == "https://api.openai.com/v1"
+    )
 
     with patch("writing_tools.ai_provider.AsyncOpenAI") as mock_async_openai:
         mock_async_openai.return_value = MagicMock()
@@ -434,3 +449,75 @@ def test_config_migration_and_utf8_atomic_save(tmp_path):
         persisted = json.load(f)
     assert persisted["custom_note"] == "Tiếng Việt UTF-8"
     assert WritingToolApp._to_pynput_hotkey("Ctrl + Shift + P") == "<ctrl>+<shift>+p"
+
+
+def test_strip_thinking_tags_for_reasoning_models():
+    # Issue #109: DeepSeek R1 / QwQ style <think>...</think> blocks
+    raw = "<think>\nLet me analyze the grammar carefully...\n</think>\n\nCorrected sentence."
+    assert ai_provider.strip_thinking_tags(raw) == "Corrected sentence."
+    assert ai_provider.strip_thinking_tags("Normal output") == "Normal output"
+
+
+def test_response_window_copy_latest_markdown(qapp):
+    # Issues #249 & #170: Copy as Markdown must copy latest response, not only first
+    app = DummyApp()
+    win = ResponseWindow(app, "Summary Result")
+    win.selected_text = "Original text"
+    win.set_text("First summary")
+    win.input_field.setText("Give me more detail")
+    win.send_message()
+    win.handle_followup_response("Second follow-up answer")
+    assert win.get_first_response_text() == "First summary"
+    assert win.get_latest_response_text() == "Second follow-up answer"
+    win.copy_latest_response()
+    assert QtWidgets.QApplication.clipboard().text() == "Second follow-up answer"
+    win.close()
+
+
+def test_single_instance_lock_enforcement(tmp_path):
+    # Issue #233: Single instance enforcement via QLockFile
+    from writing_tools.main import acquire_single_instance_lock
+
+    lock_path = str(tmp_path / "wt-test.lock")
+    first = acquire_single_instance_lock(lock_path)
+    assert first is not None
+    second = acquire_single_instance_lock(lock_path)
+    assert second is None
+    first.unlock()
+    third = acquire_single_instance_lock(lock_path)
+    assert third is not None
+    third.unlock()
+
+
+def test_gui_clipboard_avoids_pyperclip_deadlock_and_vk_shortcuts(qapp, monkeypatch):
+    # Issue #288: GUI-thread clipboard read must use QClipboard, not pyperclip.paste()
+    QtWidgets.QApplication.clipboard().setText("qt-owned-text")
+    with patch("writing_tools.app.pyperclip.paste", side_effect=AssertionError("must not call pyperclip.paste on GUI thread")):
+        assert WritingToolApp._read_clipboard_on_gui_thread() == "qt-owned-text"
+
+    # Issues #270 & #275: Windows virtual key codes for non-Latin layouts
+    monkeypatch.setattr(sys, "platform", "win32")
+    with patch("writing_tools.app.pykeyboard.KeyCode.from_vk", side_effect=lambda vk: f"VK_{vk:#x}"):
+        assert WritingToolApp._platform_shortcut_key("c", 0x43) == "VK_0x43"
+        assert WritingToolApp._platform_shortcut_key("v", 0x56) == "VK_0x56"
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert WritingToolApp._platform_shortcut_key("c", 0x43) == "c"
+
+    # Issues #195, #185, #183: interfering modifiers released before Ctrl chord
+    mock_ctrl = MagicMock()
+    with patch("writing_tools.app.pykeyboard.Controller", return_value=mock_ctrl):
+        WritingToolApp._simulate_ctrl_chord("c", 0x43)
+        assert mock_ctrl.release.call_count >= 1
+        mock_ctrl.pressed.assert_called_once()
+
+
+def test_popup_window_has_tool_flag_no_taskbar_entry(qapp, tmp_path, monkeypatch):
+    # Issue #142: popup window should not flash a taskbar button
+    from PySide6 import QtCore
+
+    monkeypatch.setattr("writing_tools.ui.custom_popup_window.get_data_dir", lambda: str(tmp_path))
+    app = DummyApp()
+    popup = CustomPopupWindow(app)
+    assert bool(popup.windowFlags() & QtCore.Qt.WindowType.Tool)
+    popup.close()

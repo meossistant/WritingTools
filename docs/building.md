@@ -12,4 +12,10 @@
 
 The standalone executable will be created in `dist/`.
 
+## Automated Builds via GitHub Actions
+
+This repository includes GitHub Actions workflows in `.github/workflows/`:
+- **`ci.yml`**: Runs compile checks and the `pytest` test suite on `ubuntu-latest` and `windows-latest` on pushes/PRs to `main`.
+- **`build.yml`**: Builds standalone Windows (`.zip`) and Linux (`.tar.gz`) PyInstaller executables on pushes to `main`, manual dispatches, and `v*` tags (automatically publishing a GitHub Release on `v*` tags).
+
 [Back to main README](../README.md)

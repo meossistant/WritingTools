@@ -536,6 +536,64 @@ class WritingToolApp(QtWidgets.QApplication):
         except Exception as e:
             logging.error(f"Error showing popup window: {e}", exc_info=True)
 
+    @staticmethod
+    def _release_interfering_modifiers(kbrd):
+        """
+        Release Alt/Win/Shift modifiers that may still be physically held from
+        the user's activation shortcut so simulated Ctrl+C / Ctrl+V does not turn
+        into Ctrl+Alt+C ('₢'), Ctrl+Win+C (Windows color filters), or bare 'c'.
+        """
+        modifier_names = (
+            "alt", "alt_l", "alt_r", "alt_gr",
+            "cmd", "cmd_l", "cmd_r",
+            "shift", "shift_l", "shift_r",
+        )
+        for name in modifier_names:
+            key = getattr(pykeyboard.Key, name, None)
+            if key is not None:
+                try:
+                    kbrd.release(key)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _platform_shortcut_key(char: str, windows_vk: int):
+        """
+        Use Windows virtual key codes (e.g., 0x43 for C, 0x56 for V) so Ctrl+C /
+        Ctrl+V works reliably regardless of active non-Latin keyboard layouts.
+        """
+        if sys.platform.startswith("win32"):
+            return pykeyboard.KeyCode.from_vk(windows_vk)
+        return char
+
+    @classmethod
+    def _simulate_ctrl_chord(cls, char: str, windows_vk: int):
+        """Safely inject Ctrl+<key> after clearing interfering modifiers."""
+        kbrd = pykeyboard.Controller()
+        cls._release_interfering_modifiers(kbrd)
+        target_key = cls._platform_shortcut_key(char, windows_vk)
+        with kbrd.pressed(pykeyboard.Key.ctrl):
+            kbrd.press(target_key)
+            kbrd.release(target_key)
+
+    @staticmethod
+    def _read_clipboard_on_gui_thread() -> str:
+        """
+        Read clipboard via Qt's QClipboard on the GUI thread to avoid the Linux
+        X11 deadlock where spawning `xclip -o` via pyperclip hangs forever if
+        Writing Tools itself currently owns the clipboard.
+        """
+        try:
+            cb = QtWidgets.QApplication.clipboard()
+            if cb is not None:
+                return cb.text() or ""
+        except Exception:
+            pass
+        try:
+            return pyperclip.paste() or ""
+        except Exception:
+            return ""
+
     def _fire_ctrl_c_and_capture_async(self, holder):
         """
         Inject Ctrl+C while focus is still on the source app, then poll the
@@ -545,23 +603,14 @@ class WritingToolApp(QtWidgets.QApplication):
         with self._capture_lock:
             self._capture_generation += 1
             my_gen = self._capture_generation
-            # Only capture a fresh clipboard backup if no earlier capture is actively holding it;
-            # otherwise preserve the original user clipboard contents.
             if my_gen == 1 or not getattr(self, "_capture_active", False):
-                try:
-                    self._clipboard_backup = pyperclip.paste()
-                except Exception:
-                    self._clipboard_backup = ""
+                self._clipboard_backup = self._read_clipboard_on_gui_thread()
                 self._capture_active = True
 
             self.clear_clipboard()
 
-            kbrd = pykeyboard.Controller()
             try:
-                kbrd.press(pykeyboard.Key.ctrl.value)
-                kbrd.press("c")
-                kbrd.release("c")
-                kbrd.release(pykeyboard.Key.ctrl.value)
+                self._simulate_ctrl_chord("c", 0x43)
             except Exception as e:
                 logging.error(f"Error simulating Ctrl+C: {e}")
 
@@ -571,7 +620,6 @@ class WritingToolApp(QtWidgets.QApplication):
                 deadline = time.time() + 2.0
                 while time.time() < deadline:
                     if self._capture_generation != my_gen:
-                        # A newer capture superseded this one; stop polling without restoring yet
                         return
                     try:
                         text = pyperclip.paste() or ""
@@ -597,6 +645,13 @@ class WritingToolApp(QtWidgets.QApplication):
 
     @staticmethod
     def clear_clipboard():
+        try:
+            cb = QtWidgets.QApplication.clipboard()
+            if cb is not None:
+                cb.clear()
+                return
+        except Exception:
+            pass
         try:
             pyperclip.copy("")
         except Exception as e:
@@ -740,15 +795,11 @@ class WritingToolApp(QtWidgets.QApplication):
                 if self.current_response_window is not None:
                     self.current_response_window.set_text(self.output_queue.rstrip("\n"))
                 else:
-                    clipboard_backup = pyperclip.paste()
+                    clipboard_backup = self._read_clipboard_on_gui_thread()
                     cleaned_text = self.output_queue.rstrip("\n")
                     pyperclip.copy(cleaned_text)
 
-                    kbrd = pykeyboard.Controller()
-                    kbrd.press(pykeyboard.Key.ctrl.value)
-                    kbrd.press("v")
-                    kbrd.release("v")
-                    kbrd.release(pykeyboard.Key.ctrl.value)
+                    self._simulate_ctrl_chord("v", 0x56)
 
                     time.sleep(0.2)
                     pyperclip.copy(clipboard_backup)
@@ -776,9 +827,15 @@ class WritingToolApp(QtWidgets.QApplication):
         self.tray_icon.setToolTip("WritingTools")
         self.tray_menu = QtWidgets.QMenu()
         self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
 
         self.update_tray_menu()
         self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        """Open the popup window when the user left-clicks the system tray icon."""
+        if reason == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger and not self.paused:
+            self._show_popup()
 
     def update_tray_menu(self):
         if self.tray_menu is None:

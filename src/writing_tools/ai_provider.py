@@ -11,6 +11,7 @@ message history translation, and model settings across all supported AI provider
 import base64
 import binascii
 import logging
+import re
 import threading
 import webbrowser
 from abc import ABC, abstractmethod
@@ -39,6 +40,30 @@ from writing_tools.ui.ui_utils import COLOR_MODE
 # Obfuscation prefix to identify obfuscated API keys
 _OBFUSCATION_PREFIX = "enc:"
 _XOR_KEY = 0x5A  # Lightweight XOR obfuscation key (prevents casual plaintext scanning)
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_thinking_tags(text: str) -> str:
+    """
+    Strip `<think>...</think>` reasoning blocks emitted by reasoning models
+    (e.g., DeepSeek R1, QwQ, Qwen3) so raw chain-of-thought is never pasted
+    into the user's editor.
+    """
+    if not text:
+        return ""
+    cleaned = _THINK_TAG_RE.sub("", text)
+    return cleaned.strip()
+
+
+def parse_max_tokens(raw_value, default: int = 8192) -> int:
+    """Parse a positive integer max_tokens setting with a safe default fallback."""
+    try:
+        parsed = int(str(raw_value).strip())
+        if parsed > 0:
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    return default
 
 
 def obfuscate_api_key(key: str) -> str:
@@ -426,7 +451,7 @@ class AIProvider(ABC):
                 logging.debug(f"{self.provider_name} request was cancelled; discarding response.")
                 return ""
 
-            response_text = (response.text or "").strip()
+            response_text = strip_thinking_tags(response.text or "")
 
             if not return_response and self.app.current_response_window is None:
                 self.app.output_ready_signal.emit(response_text)
@@ -525,6 +550,7 @@ class GeminiProvider(AIProvider):
     def __init__(self, app):
         self.api_key = ""
         self.model_name = "gemini-flash-latest"
+        self.max_tokens = "8192"
 
         settings = [
             TextSetting(
@@ -549,6 +575,12 @@ class GeminiProvider(AIProvider):
                 ],
                 allow_custom=True,
                 custom_placeholder="e.g., gemini-4-argon, gemini-3.6-flash",
+            ),
+            TextSetting(
+                name="max_tokens",
+                display_name="Max Output Tokens",
+                default_value="8192",
+                description="Maximum response tokens (e.g., 2048, 4096, 8192)",
             ),
         ]
         super().__init__(
@@ -581,7 +613,7 @@ class GeminiProvider(AIProvider):
 
     def _build_model_settings(self) -> GoogleModelSettings:
         settings: GoogleModelSettings = {
-            "max_tokens": 8192,
+            "max_tokens": parse_max_tokens(self.max_tokens, default=8192),
             "google_safety_settings": self._SAFETY_SETTINGS,
         }
         thinking_cfg = self._build_thinking_config()
@@ -624,6 +656,7 @@ class OpenAICompatibleProvider(AIProvider):
         self.api_organisation = ""
         self.api_project = ""
         self.api_model = "gpt-6-luna"
+        self.max_tokens = "8192"
 
         settings = [
             TextSetting(
@@ -653,6 +686,12 @@ class OpenAICompatibleProvider(AIProvider):
                 allow_custom=True,
                 custom_placeholder="e.g., gpt-6-sol, claude-sonnet, deepseek-chat",
             ),
+            TextSetting(
+                name="max_tokens",
+                display_name="Max Output Tokens",
+                default_value="8192",
+                description="Maximum response tokens (e.g., 2048, 4096, 8192)",
+            ),
         ]
         super().__init__(
             app,
@@ -665,14 +704,32 @@ class OpenAICompatibleProvider(AIProvider):
             lambda: webbrowser.open("https://platform.openai.com/account/api-keys"),
         )
 
+    @staticmethod
+    def _normalize_base_url(raw_url: str) -> Optional[str]:
+        """
+        Clean common OpenAI-compatible base URL mistakes (such as trailing
+        `/chat/completions` or Groq's `https://api.groq.com/openai` missing `/v1`).
+        """
+        url = (raw_url or "").strip().rstrip("/")
+        if not url:
+            return None
+        if url.endswith("/chat/completions"):
+            url = url[: -len("/chat/completions")].rstrip("/")
+        if url.lower() == "https://api.groq.com/openai":
+            url = "https://api.groq.com/openai/v1"
+        return url
+
     def _supports_temperature(self) -> bool:
         model = (self.api_model or "").strip().lower()
         return not model.startswith(self._NO_TEMPERATURE_PREFIXES)
 
-    def _build_model_settings(self) -> Optional[OpenAIChatModelSettings]:
+    def _build_model_settings(self) -> OpenAIChatModelSettings:
+        settings: OpenAIChatModelSettings = {
+            "max_tokens": parse_max_tokens(self.max_tokens, default=8192),
+        }
         if self._supports_temperature():
-            return OpenAIChatModelSettings(temperature=0.5)
-        return None
+            settings["temperature"] = 0.5
+        return settings
 
     def _missing_config_message(self) -> tuple[str, str]:
         return (
@@ -682,7 +739,7 @@ class OpenAICompatibleProvider(AIProvider):
 
     def _build_model(self) -> Optional[Model]:
         key = (self.api_key or "").strip()
-        base = (self.api_base or "").strip() or None
+        base = self._normalize_base_url(self.api_base)
         org = (self.api_organisation or "").strip() or None
         project = (self.api_project or "").strip() or None
         model_name = (self.api_model or "gpt-6-luna").strip()
@@ -719,6 +776,7 @@ class LlamaCppProvider(AIProvider):
         self.api_base = "http://127.0.0.1:8080/v1"
         self.api_model = "gemma-4-E2B-it"
         self.api_key = ""
+        self.max_tokens = "4096"
 
         settings = [
             TextSetting(
@@ -742,6 +800,12 @@ class LlamaCppProvider(AIProvider):
                 ],
                 allow_custom=True,
                 custom_placeholder="e.g., gemma-4-E2B-it, ggml-org/gemma-4-E2B-it-GGUF",
+            ),
+            TextSetting(
+                name="max_tokens",
+                display_name="Max Output Tokens",
+                default_value="4096",
+                description="Maximum response tokens (e.g., 2048, 4096, 8192)",
             ),
             TextSetting(
                 name="api_key",
@@ -774,7 +838,10 @@ class LlamaCppProvider(AIProvider):
         return url
 
     def _build_model_settings(self) -> OpenAIChatModelSettings:
-        return OpenAIChatModelSettings(temperature=0.5, max_tokens=4096)
+        return OpenAIChatModelSettings(
+            temperature=0.5,
+            max_tokens=parse_max_tokens(self.max_tokens, default=4096),
+        )
 
     def _missing_config_message(self) -> tuple[str, str]:
         return (
