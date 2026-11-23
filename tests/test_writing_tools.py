@@ -20,7 +20,7 @@ except ImportError:
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart  # noqa: E402
 from pydantic_ai.models.function import FunctionModel  # noqa: E402
 from pydantic_ai.models.google import GoogleModel  # noqa: E402
-from pydantic_ai.models.openai import OpenAIChatModel  # noqa: E402
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel  # noqa: E402
 from PySide6 import QtWidgets  # noqa: E402
 
 from writing_tools import ai_provider  # noqa: E402
@@ -93,15 +93,41 @@ class DummyApp:
         return WritingToolApp._to_pynput_hotkey(hotkey_str)
 
 
-def test_api_key_obfuscation_roundtrip_and_corrupt_recovery():
+def test_api_key_obfuscation_roundtrip_and_corrupt_recovery(tmp_path, monkeypatch):
+    import base64
+    from writing_tools import secrets as wt_secrets
+
+    monkeypatch.setattr("writing_tools.secrets.get_data_dir", lambda: str(tmp_path))
     secret = "AIzaSyTestKey_12345-xyz"
     obf = ai_provider.obfuscate_api_key(secret)
-    assert obf.startswith("enc:")
+    assert obf.startswith(("enc2:", "dpapi:"))
     assert obf != secret
     assert ai_provider.obfuscate_api_key(obf) == obf
     assert ai_provider.deobfuscate_api_key(obf) == secret
     assert ai_provider.deobfuscate_api_key("plain-key") == "plain-key"
     assert ai_provider.deobfuscate_api_key("enc:%%%not-valid-base64%%%") == ""
+    assert ai_provider.deobfuscate_api_key("enc2:%%%not-valid-base64%%%") == ""
+
+    # Legacy enc: XOR key remains readable and upgrades cleanly
+    legacy_xored = bytes(b ^ 0x5A for b in secret.encode("utf-8"))
+    legacy_enc = "enc:" + base64.b64encode(legacy_xored).decode("ascii")
+    assert ai_provider.deobfuscate_api_key(legacy_enc) == secret
+    upgraded = ai_provider.obfuscate_api_key(legacy_enc)
+    assert upgraded.startswith(("enc2:", "dpapi:"))
+    assert ai_provider.deobfuscate_api_key(upgraded) == secret
+
+    # Tampered enc2 payload fails HMAC authentication
+    if obf.startswith("enc2:"):
+        raw_blob = bytearray(base64.b64decode(obf[len("enc2:"):]))
+        raw_blob[-1] ^= 0xFF
+        tampered = "enc2:" + base64.b64encode(bytes(raw_blob)).decode("ascii")
+        assert wt_secrets.unprotect_secret(tampered) == ""
+
+    # env:VAR_NAME reference stays verbatim in config/UI and resolves at runtime
+    monkeypatch.setenv("WT_TEST_SECRET_KEY", "sk-from-env-999")
+    assert ai_provider.obfuscate_api_key("env:WT_TEST_SECRET_KEY") == "env:WT_TEST_SECRET_KEY"
+    assert ai_provider.deobfuscate_api_key("env:WT_TEST_SECRET_KEY") == "env:WT_TEST_SECRET_KEY"
+    assert ai_provider.deobfuscate_api_key("env:WT_TEST_SECRET_KEY", resolve_env=True) == "sk-from-env-999"
 
 
 def test_pydantic_ai_message_conversion_single_and_multiturn():
@@ -321,7 +347,7 @@ def test_settings_window_deobfuscates_key_and_preserves_locale(qapp):
     assert app.config["is_config_file_updated_for_v8"] is True
     assert app.config["is_config_file_updated_for_v9"] is True
     stored_key = app.config["providers"][gemini.provider_name]["api_key"]
-    assert stored_key.startswith("enc:")
+    assert stored_key.startswith(("enc2:", "dpapi:"))
     assert ai_provider.deobfuscate_api_key(stored_key) == "my-real-secret-key"
     assert isinstance(app.current_provider.model, GoogleModel)
     win.close()
@@ -442,8 +468,8 @@ def test_config_migration_and_utf8_atomic_save(tmp_path):
     assert app.config["is_config_file_updated_for_v9"] is True
     assert app.config["provider"] == "llama.cpp (Local LLM)"
     assert app.config["providers"]["Gemini (Recommended)"]["model_name"] == "gemini-flash-latest"
-    assert app.config["providers"]["Gemini (Recommended)"]["api_key"].startswith("enc:")
-    assert app.config["providers"]["OpenAI Compatible (For Experts)"]["api_key"].startswith("enc:")
+    assert app.config["providers"]["Gemini (Recommended)"]["api_key"].startswith(("enc2:", "dpapi:"))
+    assert app.config["providers"]["OpenAI Compatible (For Experts)"]["api_key"].startswith(("enc2:", "dpapi:"))
 
     with open(app.config_path, "r", encoding="utf-8") as f:
         persisted = json.load(f)
@@ -585,3 +611,90 @@ def test_languagetool_external_server_provider():
         assert len(app.output_ready_signal.emissions) == 0
         assert len(app.show_message_signal.emissions) == 1
         assert "Unreachable" in app.show_message_signal.emissions[0][0]
+
+
+def test_openai_responses_api_mode_and_env_key(monkeypatch):
+    # PR #255: OpenAI Responses API toggle + env:VAR_NAME secret resolution
+    monkeypatch.setenv("WT_OPENAI_TEST_KEY", "sk-env-responses-key")
+    app = DummyApp()
+    provider = ai_provider.OpenAICompatibleProvider(app)
+
+    assert (
+        provider._normalize_base_url("https://api.openai.com/v1/responses")
+        == "https://api.openai.com/v1"
+    )
+
+    provider.load_config({
+        "api_key": "env:WT_OPENAI_TEST_KEY",
+        "api_base": "https://api.openai.com/v1",
+        "api_mode": "responses",
+        "api_model": "gpt-5.4-mini",
+        "max_tokens": "4096",
+    })
+    assert isinstance(provider.model, OpenAIResponsesModel)
+    assert provider.model.model_name == "gpt-5.4-mini"
+    assert "temperature" not in provider._build_model_settings()
+    assert provider._build_model_settings()["max_tokens"] == 4096
+
+    # Model override switches model without mutating global provider setting
+    override_model = provider._build_model(model_override="gpt-4.1-mini")
+    assert isinstance(override_model, OpenAIResponsesModel)
+    assert override_model.model_name == "gpt-4.1-mini"
+    assert provider.api_model == "gpt-5.4-mini"
+    assert provider._build_model_settings(model_override="gpt-4.1-mini")["temperature"] == 0.5
+
+
+def test_per_button_provider_and_model_override(qapp):
+    # Issues #135, #17, #206: per-button provider/model override & icon picker
+    app = DummyApp()
+    gemini = ai_provider.GeminiProvider(app)
+    lt = ai_provider.LanguageToolProvider(app)
+    app.providers = [gemini, lt]
+    app.current_provider = gemini
+    app.config["providers"][lt.provider_name] = {
+        "api_base": "http://127.0.0.1:8010",
+        "language": "en-US",
+        "level": "picky",
+    }
+
+    # Bind resolve_provider_for_option on DummyApp
+    resolved_prov, resolved_model = WritingToolApp.resolve_provider_for_option(
+        app,
+        {"provider": lt.provider_name, "model": "en-GB"},
+    )
+    assert resolved_prov is lt
+    assert resolved_model == "en-GB"
+    assert lt.level == "picky"
+
+    # Default fallback when no provider override is specified
+    default_prov, override_model = WritingToolApp.resolve_provider_for_option(
+        app,
+        {"model": "gemini-3.5-flash-lite"},
+    )
+    assert default_prov is gemini
+    assert override_model == "gemini-3.5-flash-lite"
+
+    # ButtonEditDialog roundtrips provider, model, and icon cleanly
+    dlg = ButtonEditDialog(
+        None,
+        {
+            "name": "Proofread",
+            "prefix": "Proofread:\n\n",
+            "instruction": "Fix grammar.",
+            "icon": "icons/magnifying_glass",
+            "open_in_window": False,
+            "provider": lt.provider_name,
+            "model": "en-GB",
+        },
+        provider_names=[gemini.provider_name, lt.provider_name],
+    )
+    bd = dlg.get_button_data()
+    assert bd["provider"] == lt.provider_name
+    assert bd["model"] == "en-GB"
+    assert bd["icon"] == "icons/magnifying_glass"
+    dlg.close()
+
+    entry = CustomPopupWindow._build_button_entry(bd)
+    assert entry["provider"] == lt.provider_name
+    assert entry["model"] == "en-GB"
+

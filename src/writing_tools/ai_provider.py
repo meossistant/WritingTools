@@ -8,8 +8,6 @@ and `OpenAIChatModel` backed by local `llama.cpp` `llama-server`) with
 message history translation, and model settings across all supported AI providers.
 """
 
-import base64
-import binascii
 import json
 import logging
 import re
@@ -32,18 +30,21 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+from pydantic_ai.models.openai import (
+    OpenAIChatModel,
+    OpenAIChatModelSettings,
+    OpenAIResponsesModel,
+    OpenAIResponsesModelSettings,
+)
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 from PySide6 import QtWidgets
 from PySide6.QtWidgets import QLineEdit, QVBoxLayout
 
+from writing_tools.secrets import protect_secret, resolve_env_reference, unprotect_secret
 from writing_tools.ui.ui_utils import COLOR_MODE
 
-# Obfuscation prefix to identify obfuscated API keys
-_OBFUSCATION_PREFIX = "enc:"
-_XOR_KEY = 0x5A  # Lightweight XOR obfuscation key (prevents casual plaintext scanning)
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
 
@@ -72,30 +73,19 @@ def parse_max_tokens(raw_value, default: int = 8192) -> int:
 
 def obfuscate_api_key(key: str) -> str:
     """
-    Obfuscate an API key using XOR + Base64 encoding.
-    Returns the obfuscated string with 'enc:' prefix.
+    Protect an API key for storage in `config.json`.
+    Uses Windows DPAPI (`dpapi:`), Linux authenticated keyfile encryption (`enc2:`),
+    or preserves `env:VAR_NAME` environment-variable references unchanged.
     """
-    if not key or key.startswith(_OBFUSCATION_PREFIX):
-        return key
-    xored = bytes(b ^ _XOR_KEY for b in key.encode("utf-8"))
-    return _OBFUSCATION_PREFIX + base64.b64encode(xored).decode("ascii")
+    return protect_secret(key)
 
 
-def deobfuscate_api_key(obfuscated: str) -> str:
+def deobfuscate_api_key(obfuscated: str, *, resolve_env: bool = False) -> str:
     """
-    Deobfuscate an API key that was obfuscated with obfuscate_api_key().
-    If the key doesn't have the 'enc:' prefix, returns it as-is (plaintext).
-    Gracefully handles malformed values instead of crashing startup.
+    Recover a stored API key (`dpapi:`, `enc2:`, legacy `enc:`, `env:`, or plaintext).
+    When `resolve_env=False`, `env:VAR_NAME` is kept verbatim for Settings display.
     """
-    if not obfuscated or not obfuscated.startswith(_OBFUSCATION_PREFIX):
-        return obfuscated or ""
-    encoded = obfuscated[len(_OBFUSCATION_PREFIX):]
-    try:
-        xored = base64.b64decode(encoded, validate=True)
-        return bytes(b ^ _XOR_KEY for b in xored).decode("utf-8")
-    except (binascii.Error, ValueError, UnicodeDecodeError) as e:
-        logging.warning(f"Failed to deobfuscate stored API key: {e}")
-        return ""
+    return unprotect_secret(obfuscated, resolve_env=resolve_env)
 
 
 class AIProviderSetting(ABC):
@@ -398,11 +388,11 @@ class AIProvider(ABC):
         return messages
 
     @abstractmethod
-    def _build_model(self) -> Optional[Model]:
+    def _build_model(self, model_override: Optional[str] = None) -> Optional[Model]:
         """Construct and return the configured Pydantic AI `Model`, or None if unconfigured."""
         pass
 
-    def _build_model_settings(self) -> Optional[ModelSettings]:
+    def _build_model_settings(self, model_override: Optional[str] = None) -> Optional[ModelSettings]:
         """Return provider-specific Pydantic AI `ModelSettings` for each request."""
         return None
 
@@ -427,26 +417,33 @@ class AIProvider(ABC):
         )
 
     def get_response(
-        self, system_instruction: str, prompt: str | list, return_response: bool = False
+        self,
+        system_instruction: str,
+        prompt: str | list,
+        return_response: bool = False,
+        model_override: Optional[str] = None,
     ) -> str:
         """
         Execute a synchronous Pydantic AI model request and either return the text
         (for window/chat mode) or emit it via `output_ready_signal` (for inline replacement).
+        Supports an optional per-button `model_override` without mutating global config.
         """
         self.close_requested = False
         self._cancel_event.clear()
 
-        if self.model is None:
+        override = (model_override or "").strip() or None
+        active_model = self._build_model(model_override=override) if override else self.model
+        if active_model is None:
             title, body = self._missing_config_message()
             self.app.show_message_signal.emit(title, body)
             return ""
 
         try:
             messages = self.build_messages(system_instruction, prompt)
-            model_settings = self._build_model_settings()
+            model_settings = self._build_model_settings(model_override=override)
 
             response = model_request_sync(
-                self.model,
+                active_model,
                 messages,
                 model_settings=model_settings,
             )
@@ -560,7 +557,7 @@ class GeminiProvider(AIProvider):
             TextSetting(
                 name="api_key",
                 display_name="API Key",
-                description="Paste your Gemini API key here",
+                description="Paste your Gemini API key (or env:GEMINI_API_KEY)",
                 is_secret=True,
             ),
             DropdownSetting(
@@ -599,12 +596,12 @@ class GeminiProvider(AIProvider):
             lambda: webbrowser.open("https://aistudio.google.com/app/apikey"),
         )
 
-    def _build_thinking_config(self) -> Optional[dict]:
+    def _build_thinking_config(self, model_override: Optional[str] = None) -> Optional[dict]:
         """
         Choose the lowest-latency Google ThinkingConfig dict supported by the active model.
         Returns None when `google_thinking_config` should be omitted (e.g., Gemma models).
         """
-        model = (self.model_name or "").strip().lower()
+        model = (model_override or self.model_name or "").strip().lower()
         if not model or "gemma" in model:
             return None
         if model in self._MINIMAL_THINKING_MODELS:
@@ -615,12 +612,12 @@ class GeminiProvider(AIProvider):
             return {"thinking_budget": 0}
         return None
 
-    def _build_model_settings(self) -> GoogleModelSettings:
+    def _build_model_settings(self, model_override: Optional[str] = None) -> GoogleModelSettings:
         settings: GoogleModelSettings = {
             "max_tokens": parse_max_tokens(self.max_tokens, default=8192),
             "google_safety_settings": self._SAFETY_SETTINGS,
         }
-        thinking_cfg = self._build_thinking_config()
+        thinking_cfg = self._build_thinking_config(model_override=model_override)
         if thinking_cfg is not None:
             settings["google_thinking_config"] = thinking_cfg
         return settings
@@ -631,9 +628,9 @@ class GeminiProvider(AIProvider):
             "Please configure your Gemini API key in Settings before using Writing Tools.",
         )
 
-    def _build_model(self) -> Optional[Model]:
-        key = (self.api_key or "").strip()
-        model_name = (self.model_name or "gemini-flash-latest").strip()
+    def _build_model(self, model_override: Optional[str] = None) -> Optional[Model]:
+        key = resolve_env_reference((self.api_key or "").strip()).strip()
+        model_name = (model_override or self.model_name or "gemini-flash-latest").strip()
         if not key:
             logging.warning("Gemini API key is empty; Pydantic AI GoogleModel not initialized.")
             return None
@@ -648,7 +645,7 @@ class GeminiProvider(AIProvider):
 class OpenAICompatibleProvider(AIProvider):
     """
     OpenAI and OpenAI-compatible provider managed via Pydantic AI
-    (`OpenAIChatModel` + `OpenAIProvider`).
+    (`OpenAIChatModel` or `OpenAIResponsesModel` + `OpenAIProvider`).
     """
 
     # Reasoning-capable OpenAI families that reject custom `temperature` values
@@ -657,6 +654,7 @@ class OpenAICompatibleProvider(AIProvider):
     def __init__(self, app):
         self.api_key = ""
         self.api_base = "https://api.openai.com/v1"
+        self.api_mode = "chat"
         self.api_organisation = ""
         self.api_project = ""
         self.api_model = "gpt-6-luna"
@@ -666,7 +664,7 @@ class OpenAICompatibleProvider(AIProvider):
             TextSetting(
                 name="api_key",
                 display_name="API Key",
-                description="API key for the OpenAI-compatible API",
+                description="API key (or env:OPENAI_API_KEY)",
                 is_secret=True,
             ),
             TextSetting(
@@ -674,6 +672,16 @@ class OpenAICompatibleProvider(AIProvider):
                 "API Base URL",
                 "https://api.openai.com/v1",
                 "E.g. https://api.openai.com/v1",
+            ),
+            DropdownSetting(
+                name="api_mode",
+                display_name="API Mode",
+                default_value="chat",
+                description="Use Chat Completions API (broadest compatibility) or OpenAI Responses API",
+                options=[
+                    ("Chat Completions API (default)", "chat"),
+                    ("Responses API (OpenAI)", "responses"),
+                ],
             ),
             TextSetting("api_organisation", "API Organisation", "", "Leave blank if not applicable"),
             TextSetting("api_project", "API Project", "", "Leave blank if not applicable"),
@@ -701,8 +709,8 @@ class OpenAICompatibleProvider(AIProvider):
             app,
             "OpenAI Compatible (For Experts)",
             settings,
-            "• Connect to ANY OpenAI-compatible API (v1/chat/completions).\n"
-            "• You must abide by the service's Terms of Service.",
+            "• Connect to ANY OpenAI-compatible API (Chat Completions or OpenAI Responses API).\n"
+            "• Supports env:VAR_NAME references for API keys.",
             "openai",
             "Get OpenAI API Key",
             lambda: webbrowser.open("https://platform.openai.com/account/api-keys"),
@@ -712,26 +720,34 @@ class OpenAICompatibleProvider(AIProvider):
     def _normalize_base_url(raw_url: str) -> Optional[str]:
         """
         Clean generic OpenAI-compatible base URL copy-paste mistakes
-        (trailing whitespace/slashes or an accidental `/chat/completions` suffix).
+        (trailing whitespace/slashes or accidental `/chat/completions` / `/responses` suffixes).
         """
         url = (raw_url or "").strip().rstrip("/")
         if not url:
             return None
-        if url.endswith("/chat/completions"):
-            url = url[: -len("/chat/completions")].rstrip("/")
+        for suffix in ("/chat/completions", "/responses"):
+            if url.endswith(suffix):
+                url = url[: -len(suffix)].rstrip("/")
         return url
 
-    def _supports_temperature(self) -> bool:
-        model = (self.api_model or "").strip().lower()
+    def _supports_temperature(self, model_override: Optional[str] = None) -> bool:
+        model = (model_override or self.api_model or "").strip().lower()
         return not model.startswith(self._NO_TEMPERATURE_PREFIXES)
 
-    def _build_model_settings(self) -> OpenAIChatModelSettings:
-        settings: OpenAIChatModelSettings = {
-            "max_tokens": parse_max_tokens(self.max_tokens, default=8192),
-        }
-        if self._supports_temperature():
-            settings["temperature"] = 0.5
-        return settings
+    def _build_model_settings(
+        self, model_override: Optional[str] = None
+    ) -> OpenAIChatModelSettings | OpenAIResponsesModelSettings:
+        mode = (self.api_mode or "chat").strip().lower()
+        max_tok = parse_max_tokens(self.max_tokens, default=8192)
+        if mode == "responses":
+            settings: OpenAIResponsesModelSettings = {"max_tokens": max_tok}
+            if self._supports_temperature(model_override=model_override):
+                settings["temperature"] = 0.5
+            return settings
+        settings_chat: OpenAIChatModelSettings = {"max_tokens": max_tok}
+        if self._supports_temperature(model_override=model_override):
+            settings_chat["temperature"] = 0.5
+        return settings_chat
 
     def _missing_config_message(self) -> tuple[str, str]:
         return (
@@ -739,15 +755,16 @@ class OpenAICompatibleProvider(AIProvider):
             "Please configure your API Key and Base URL in Settings before using Writing Tools.",
         )
 
-    def _build_model(self) -> Optional[Model]:
-        key = (self.api_key or "").strip()
+    def _build_model(self, model_override: Optional[str] = None) -> Optional[Model]:
+        key = resolve_env_reference((self.api_key or "").strip()).strip()
         base = self._normalize_base_url(self.api_base)
         org = (self.api_organisation or "").strip() or None
         project = (self.api_project or "").strip() or None
-        model_name = (self.api_model or "gpt-6-luna").strip()
+        model_name = (model_override or self.api_model or "gpt-6-luna").strip()
+        mode = (self.api_mode or "chat").strip().lower()
 
         if not key and (base is None or "api.openai.com" in base):
-            logging.warning("OpenAI API key is empty; Pydantic AI OpenAIChatModel not initialized.")
+            logging.warning("OpenAI API key is empty; Pydantic AI OpenAI model not initialized.")
             return None
 
         try:
@@ -762,9 +779,11 @@ class OpenAICompatibleProvider(AIProvider):
                 provider = OpenAIProvider(openai_client=client)
             else:
                 provider = OpenAIProvider(base_url=base, api_key=key or "not-required")
+            if mode == "responses":
+                return OpenAIResponsesModel(model_name, provider=provider)
             return OpenAIChatModel(model_name, provider=provider)
         except Exception as e:
-            logging.error(f"Failed to initialize Pydantic AI OpenAIChatModel: {e}")
+            logging.error(f"Failed to initialize Pydantic AI OpenAI model: {e}")
             return None
 
 
@@ -839,7 +858,7 @@ class LlamaCppProvider(AIProvider):
             url = f"{url}/v1"
         return url
 
-    def _build_model_settings(self) -> OpenAIChatModelSettings:
+    def _build_model_settings(self, model_override: Optional[str] = None) -> OpenAIChatModelSettings:
         return OpenAIChatModelSettings(
             temperature=0.5,
             max_tokens=parse_max_tokens(self.max_tokens, default=4096),
@@ -852,10 +871,10 @@ class LlamaCppProvider(AIProvider):
             "and ensure llama-server is running.",
         )
 
-    def _build_model(self) -> Optional[Model]:
+    def _build_model(self, model_override: Optional[str] = None) -> Optional[Model]:
         base_url = self._normalize_base_url(self.api_base)
-        model_name = (self.api_model or "gemma-4-E2B-it").strip()
-        key = (self.api_key or "").strip() or "no-key-required"
+        model_name = (model_override or self.api_model or "gemma-4-E2B-it").strip()
+        key = resolve_env_reference((self.api_key or "").strip()).strip() or "no-key-required"
         try:
             provider = OpenAIProvider(base_url=base_url, api_key=key)
             return OpenAIChatModel(model_name, provider=provider)
@@ -1031,17 +1050,22 @@ class LanguageToolProvider(AIProvider):
             lines.append(f"- {excerpt}{suggestion} — {message} (`{rule_id}`)")
         return "\n".join(lines)
 
-    def _build_model(self) -> Optional[Model]:
+    def _build_model(self, model_override: Optional[str] = None) -> Optional[Model]:
         # LanguageTool is a non-AI REST server rather than a Pydantic AI LLM model
         return None
 
     def get_response(
-        self, system_instruction: str, prompt: str | list, return_response: bool = False
+        self,
+        system_instruction: str,
+        prompt: str | list,
+        return_response: bool = False,
+        model_override: Optional[str] = None,
     ) -> str:
         """
         Send text to the configured external LanguageTool `/v2/check` endpoint.
         In inline mode, applies top suggestions and emits corrected text;
         in window mode, returns a Markdown report with corrected text and diagnostics.
+        If `model_override` is passed on a button, it overrides the LanguageTool language code.
         """
         self.close_requested = False
         self._cancel_event.clear()
@@ -1051,15 +1075,17 @@ class LanguageToolProvider(AIProvider):
             return ""
 
         check_url = self._normalize_check_url(self.api_base)
+        lang_code = (model_override or self.language or "auto").strip() or "auto"
         payload = {
             "text": text,
-            "language": (self.language or "auto").strip() or "auto",
+            "language": lang_code,
             "level": (self.level or "default").strip() or "default",
         }
         if (self.username or "").strip():
             payload["username"] = self.username.strip()
-        if (self.api_key or "").strip():
-            payload["apiKey"] = self.api_key.strip()
+        resolved_key = resolve_env_reference((self.api_key or "").strip()).strip()
+        if resolved_key:
+            payload["apiKey"] = resolved_key
 
         encoded = urllib.parse.urlencode(payload).encode("utf-8")
         req = urllib.request.Request(

@@ -95,6 +95,7 @@ class WritingToolApp(QtWidgets.QApplication):
         self.toggle_action = None
         self.update_checker = None
         self.current_provider = None
+        self._active_request_provider = None
 
         # Holder and generation counter for async Ctrl+C clipboard capture.
         self.current_text_holder = None
@@ -274,15 +275,16 @@ class WritingToolApp(QtWidgets.QApplication):
                     logging.info(f'[v9] Bumped Gemini model "{old_model}" -> "{new_model}"')
                     config_changed = True
 
-        # Also obfuscate any legacy plaintext OpenAI-compatible API keys
-        openai_config = providers_cfg.get("OpenAI Compatible (For Experts)")
-        if isinstance(openai_config, dict):
-            api_key = openai_config.get("api_key", "")
+        # Upgrade plaintext or legacy enc: API keys across all providers to strong protection
+        for prov_name, prov_cfg in providers_cfg.items():
+            if not isinstance(prov_cfg, dict):
+                continue
+            api_key = prov_cfg.get("api_key", "")
             if api_key:
                 new_key = obfuscate_api_key(api_key)
                 if new_key != api_key:
-                    openai_config["api_key"] = new_key
-                    logging.info("[v9] Obfuscated plaintext OpenAI-compatible API key")
+                    prov_cfg["api_key"] = new_key
+                    logging.info(f"[v9] Protected API key for provider '{prov_name}'")
                     config_changed = True
 
         # Migrate legacy Ollama provider selection to llama.cpp
@@ -446,9 +448,7 @@ class WritingToolApp(QtWidgets.QApplication):
             if self.paused:
                 return
             logging.debug(f'Direct hotkey fired for button "{button_name}"')
-            if self.current_provider:
-                self.current_provider.cancel()
-                self.output_queue = ""
+            self.cancel_active_request()
             # noinspection PyTypeChecker
             QtCore.QMetaObject.invokeMethod(
                 self,
@@ -487,10 +487,8 @@ class WritingToolApp(QtWidgets.QApplication):
             self.exit_app()
             return
 
-        if self.current_provider:
-            logging.debug("Cancelling current provider's request")
-            self.current_provider.cancel()
-            self.output_queue = ""
+        logging.debug("Cancelling active provider's request")
+        self.cancel_active_request()
 
         # noinspection PyTypeChecker
         QtCore.QMetaObject.invokeMethod(
@@ -659,6 +657,39 @@ class WritingToolApp(QtWidgets.QApplication):
         except Exception as e:
             logging.error(f"Error clearing clipboard: {e}")
 
+    def cancel_active_request(self):
+        """Cancel whichever provider (global or per-button override) is currently running."""
+        for provider in {self.current_provider, self._active_request_provider}:
+            if provider is not None:
+                provider.cancel()
+        self.output_queue = ""
+
+    def resolve_provider_for_option(self, option_cfg: dict):
+        """
+        Resolve the effective `(provider, model_override)` for an option entry.
+        Supports per-button provider & model overrides (#135, #17, #206) by lazily
+        loading the target provider's saved settings without changing the global provider.
+        """
+        provider_override = (option_cfg.get("provider") or "").strip() if isinstance(option_cfg, dict) else ""
+        model_override = (option_cfg.get("model") or "").strip() if isinstance(option_cfg, dict) else ""
+
+        if provider_override:
+            target = next(
+                (p for p in self.providers if p.provider_name == provider_override),
+                None,
+            )
+            if target is not None:
+                if target is not self.current_provider:
+                    saved_cfg = (self.config or {}).get("providers", {}).get(provider_override, {})
+                    target.load_config(saved_cfg)
+                return target, (model_override or None)
+            logging.warning(
+                f"Per-button provider override '{provider_override}' not found; "
+                "falling back to global provider."
+            )
+
+        return self.current_provider, (model_override or None)
+
     def process_option(self, option, custom_change=None):
         logging.debug(f"Processing option: {option}")
         self.current_response_window = None
@@ -686,9 +717,14 @@ class WritingToolApp(QtWidgets.QApplication):
             self.show_message_signal.emit("Error", f"Option '{option}' is not available.")
             return
 
-        if not self.current_provider:
+        option_cfg = self.options[option]
+        active_provider, model_override = self.resolve_provider_for_option(option_cfg)
+
+        if not active_provider:
             self.show_message_signal.emit("Error", "No AI provider configured. Please open Settings.")
             return
+
+        self._active_request_provider = active_provider
 
         holder = self.current_text_holder
         if holder is None or not holder.ready.wait(timeout=3.0):
@@ -699,7 +735,6 @@ class WritingToolApp(QtWidgets.QApplication):
             self.show_message_signal.emit("Error", "Please select text to use this option.")
             return
 
-        option_cfg = self.options[option]
         open_in_window = bool(option_cfg.get("open_in_window", False))
 
         if open_in_window:
@@ -710,11 +745,15 @@ class WritingToolApp(QtWidgets.QApplication):
                 QtCore.Q_ARG(str, option),
                 QtCore.Q_ARG(str, selected_text),
             )
+            if self.current_response_window is not None:
+                self.current_response_window.active_provider = active_provider
+                self.current_response_window.model_override = model_override
+                self.current_response_window.custom_change = custom_change
 
         try:
             prompt_prefix = option_cfg.get("prefix", "")
             system_instruction = option_cfg.get("instruction", "")
-            if getattr(self.current_provider, "is_non_ai", False):
+            if getattr(active_provider, "is_non_ai", False):
                 prompt = selected_text
             elif option == "Custom":
                 prompt = f"{prompt_prefix}Described change: {custom_change}\n\nText: {selected_text}"
@@ -725,8 +764,11 @@ class WritingToolApp(QtWidgets.QApplication):
 
             if open_in_window:
                 response_window = self.current_response_window
-                response = self.current_provider.get_response(
-                    system_instruction, prompt, return_response=True
+                response = active_provider.get_response(
+                    system_instruction,
+                    prompt,
+                    return_response=True,
+                    model_override=model_override,
                 )
                 logging.debug(f"Got response of length: {len(response) if response else 0}")
 
@@ -746,7 +788,11 @@ class WritingToolApp(QtWidgets.QApplication):
                             QtCore.Qt.ConnectionType.QueuedConnection,
                         )
             else:
-                self.current_provider.get_response(system_instruction, prompt)
+                active_provider.get_response(
+                    system_instruction,
+                    prompt,
+                    model_override=model_override,
+                )
 
         except Exception as e:
             logging.error(f"An error occurred: {e}", exc_info=True)
@@ -906,11 +952,18 @@ class WritingToolApp(QtWidgets.QApplication):
                     "If appropriate, use Markdown formatting to make your response more readable."
                 )
 
+                active_provider = (
+                    getattr(response_window, "active_provider", None) or self.current_provider
+                )
+                model_override = getattr(response_window, "model_override", None)
+                self._active_request_provider = active_provider
+
                 # Pydantic AI handles message/role translation uniformly across all providers
-                response_text = self.current_provider.get_response(
+                response_text = active_provider.get_response(
                     system_instruction,
                     history,
                     return_response=True,
+                    model_override=model_override,
                 )
 
                 logging.debug(f"Got follow-up response of length: {len(response_text)}")

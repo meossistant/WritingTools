@@ -84,13 +84,29 @@ DEFAULT_OPTIONS_JSON = r"""{
 }"""
 
 
+_BUTTON_ICON_CHOICES = [
+    ("Custom (Default)", "icons/custom"),
+    ("Magnifying Glass (Proofread)", "icons/magnifying_glass"),
+    ("Rewrite", "icons/rewrite"),
+    ("Smiley Face (Friendly)", "icons/smiley_face"),
+    ("Briefcase (Professional)", "icons/briefcase"),
+    ("Concise", "icons/concise"),
+    ("Table", "icons/table"),
+    ("Key Points", "icons/keypoints"),
+    ("Summary", "icons/summary"),
+    ("List", "icons/list"),
+    ("Rotate Left", "icons/rotate_left"),
+]
+
+
 class ButtonEditDialog(QDialog):
     """
     Dialog for editing or creating a button's properties
-    (name/title, system instruction, open_in_window, optional direct hotkey).
+    (name/title, system instruction, open_in_window, icon, optional provider/model override,
+    and optional direct hotkey).
     """
 
-    def __init__(self, parent=None, button_data=None, title="Edit Button"):
+    def __init__(self, parent=None, button_data=None, title="Edit Button", provider_names=None):
         super().__init__(parent)
         self.button_data = (
             dict(button_data)
@@ -102,7 +118,13 @@ class ButtonEditDialog(QDialog):
                 "open_in_window": False,
             }
         )
+        if provider_names is None and parent is not None and getattr(parent, "app", None) is not None:
+            provider_names = [p.provider_name for p in getattr(parent.app, "providers", [])]
+        self.provider_names = list(provider_names or [])
         self.hotkey_input = None
+        self.provider_combo = None
+        self.model_override_input = None
+        self.icon_combo = None
         self.setWindowTitle(title)
         self.init_ui()
 
@@ -181,6 +203,77 @@ class ButtonEditDialog(QDialog):
         radio_layout.addWidget(self.window_radio)
         layout.addLayout(radio_layout)
 
+        field_style = f"""
+            padding: 6px;
+            border: 1px solid {'#777' if COLOR_MODE == 'dark' else '#ccc'};
+            border-radius: 8px;
+            background-color: {'#333' if COLOR_MODE == 'dark' else 'white'};
+            color: {'#fff' if COLOR_MODE == 'dark' else '#000'};
+        """
+
+        # Icon picker
+        icon_row = QHBoxLayout()
+        icon_label = QLabel("Button Icon:")
+        icon_label.setStyleSheet(
+            f"color: {'#fff' if COLOR_MODE == 'dark' else '#333'}; font-weight: bold;"
+        )
+        self.icon_combo = QtWidgets.QComboBox()
+        self.icon_combo.setStyleSheet(f"QComboBox {{ {field_style} }}")
+        current_icon = (self.button_data.get("icon") or "icons/custom").replace("-", "_")
+        matched_icon = False
+        for label_text, icon_rel in _BUTTON_ICON_CHOICES:
+            icon_file = get_resource_path(
+                icon_rel + ("_dark" if COLOR_MODE == "dark" else "_light") + ".png"
+            )
+            if os.path.exists(icon_file):
+                self.icon_combo.addItem(QtGui.QIcon(icon_file), label_text, icon_rel)
+            else:
+                self.icon_combo.addItem(label_text, icon_rel)
+            if icon_rel == current_icon:
+                self.icon_combo.setCurrentIndex(self.icon_combo.count() - 1)
+                matched_icon = True
+        if not matched_icon and current_icon:
+            self.icon_combo.addItem(current_icon, current_icon)
+            self.icon_combo.setCurrentIndex(self.icon_combo.count() - 1)
+        icon_row.addWidget(icon_label)
+        icon_row.addWidget(self.icon_combo, 1)
+        layout.addLayout(icon_row)
+
+        # Per-button Provider & Model Override (#135, #17, #206)
+        provider_row = QHBoxLayout()
+        provider_label = QLabel("Provider Override (optional):")
+        provider_label.setStyleSheet(
+            f"color: {'#fff' if COLOR_MODE == 'dark' else '#333'}; font-weight: bold;"
+        )
+        self.provider_combo = QtWidgets.QComboBox()
+        self.provider_combo.setStyleSheet(f"QComboBox {{ {field_style} }}")
+        self.provider_combo.addItem("Default (Global Provider)", "")
+        saved_provider = (self.button_data.get("provider") or "").strip()
+        for pname in self.provider_names:
+            self.provider_combo.addItem(pname, pname)
+        if saved_provider and self.provider_combo.findData(saved_provider) == -1:
+            self.provider_combo.addItem(saved_provider, saved_provider)
+        p_idx = self.provider_combo.findData(saved_provider)
+        self.provider_combo.setCurrentIndex(p_idx if p_idx != -1 else 0)
+        provider_row.addWidget(provider_label)
+        provider_row.addWidget(self.provider_combo, 1)
+        layout.addLayout(provider_row)
+
+        model_row = QHBoxLayout()
+        model_label = QLabel("Model Override (optional):")
+        model_label.setStyleSheet(
+            f"color: {'#fff' if COLOR_MODE == 'dark' else '#333'}; font-weight: bold;"
+        )
+        self.model_override_input = QLineEdit()
+        self.model_override_input.setStyleSheet(f"QLineEdit {{ {field_style} }}")
+        self.model_override_input.setPlaceholderText(
+            "Leave blank for default (e.g. gemini-3.5-flash-lite, gpt-5.4-mini, en-US)"
+        )
+        self.model_override_input.setText((self.button_data.get("model") or "").strip())
+        model_row.addWidget(model_label)
+        model_row.addWidget(self.model_override_input, 1)
+        layout.addLayout(model_row)
+
         hotkey_label = QLabel("Direct hotkey (optional):")
         hotkey_label.setStyleSheet(
             f"color: {'#fff' if COLOR_MODE == 'dark' else '#333'}; font-weight: bold;"
@@ -199,13 +292,13 @@ class ButtonEditDialog(QDialog):
             }}
         """
         )
-        self.hotkey_input.setPlaceholderText("e.g. ctrl+j  (leave blank for none)")
+        self.hotkey_input.setPlaceholderText("e.g. ctrl+j, ctrl+shift+p, or alt+alt (leave blank for none)")
         self.hotkey_input.setText(self.button_data.get("hotkey", ""))
         layout.addWidget(self.hotkey_input)
 
         hotkey_hint = QLabel(
             "Press this combination from anywhere to run this button directly, skipping the popup.\n"
-            "Use '+' between keys, e.g. ctrl+j or ctrl+shift+p."
+            "Supports combos (ctrl+j, ctrl+shift+p) and double-tap modifiers (alt+alt, ctrl+ctrl)."
         )
         hotkey_hint.setStyleSheet(
             f"color: {'#bbb' if COLOR_MODE == 'dark' else '#555'}; font-size: 12px;"
@@ -249,16 +342,27 @@ class ButtonEditDialog(QDialog):
         )
 
     def get_button_data(self):
-        # Preserve existing prefix and icon when editing built-in or customized buttons
+        # Preserve existing prefix while applying edited icon, provider/model overrides, and hotkey
+        selected_icon = (
+            self.icon_combo.currentData()
+            if self.icon_combo is not None
+            else self.button_data.get("icon", "icons/custom")
+        )
         data = {
             "name": self.name_input.text().strip(),
             "prefix": self.button_data.get(
                 "prefix", "Make this change to the following text:\n\n"
             ),
             "instruction": self.instruction_input.toPlainText(),
-            "icon": self.button_data.get("icon", "icons/custom"),
+            "icon": selected_icon or "icons/custom",
             "open_in_window": self.window_radio.isChecked(),
         }
+        provider = (self.provider_combo.currentData() or "").strip() if self.provider_combo else ""
+        if provider:
+            data["provider"] = provider
+        model = self.model_override_input.text().strip() if self.model_override_input else ""
+        if model:
+            data["model"] = model
         hotkey = self.hotkey_input.text().strip().lower() if self.hotkey_input else ""
         if hotkey:
             data["hotkey"] = hotkey
@@ -624,9 +728,17 @@ class CustomPopupWindow(QtWidgets.QWidget):
             if os.path.exists(icon_path):
                 b.setIcon(QtGui.QIcon(icon_path))
 
+            tooltip_parts = []
             hotkey = (v.get("hotkey") or "").strip()
             if hotkey:
-                b.setToolTip(f"Direct hotkey: {hotkey}")
+                tooltip_parts.append(f"Direct hotkey: {hotkey}")
+            btn_provider = (v.get("provider") or "").strip()
+            btn_model = (v.get("model") or "").strip()
+            if btn_provider or btn_model:
+                target = " / ".join(p for p in (btn_provider, btn_model) if p)
+                tooltip_parts.append(f"Override: {target}")
+            if tooltip_parts:
+                b.setToolTip("\n".join(tooltip_parts))
 
             if not self.edit_mode:
                 b.clicked.connect(partial(self.on_generic_instruction, k))
@@ -877,10 +989,11 @@ class CustomPopupWindow(QtWidgets.QWidget):
         entry["instruction"] = bd["instruction"]
         entry["icon"] = bd["icon"]
         entry["open_in_window"] = bd["open_in_window"]
-        if bd.get("hotkey"):
-            entry["hotkey"] = bd["hotkey"]
-        else:
-            entry.pop("hotkey", None)
+        for opt_key in ("hotkey", "provider", "model"):
+            if bd.get(opt_key):
+                entry[opt_key] = bd[opt_key]
+            else:
+                entry.pop(opt_key, None)
         return entry
 
     def add_new_button_clicked(self):
