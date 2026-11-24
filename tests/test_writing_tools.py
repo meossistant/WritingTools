@@ -977,5 +977,12 @@ def test_global_rule_output_language_and_settings_onboarding_roundtrip(qapp):
     onboarding.close()
 
 
+def test_smoke_test_entrypoint():
+    from writing_tools.main import run_smoke_test
+
+    assert run_smoke_test() == 0
+
+
+
 
 

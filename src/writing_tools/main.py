@@ -40,9 +40,44 @@ def acquire_single_instance_lock(lock_path: str | None = None) -> QtCore.QLockFi
     return lock_file
 
 
+def run_smoke_test() -> int:
+    """
+    Verify that all runtime imports, Pydantic AI model classes, and bundled
+    resources load cleanly (used by CI to validate frozen PyInstaller builds).
+    """
+    from pydantic_ai.models.google import GoogleModel
+    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+    from pydantic_ai.providers.google import GoogleProvider
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    from writing_tools import diff_utils, hotkey_listener, secrets, window_context  # noqa: F401
+    from writing_tools.paths import get_resource_path
+
+    # Instantiate provider/model wrappers without making network requests
+    GoogleModel("gemini-flash-latest", provider=GoogleProvider(api_key="smoke-test"))
+    OpenAIChatModel("gpt-6-luna", provider=OpenAIProvider(api_key="smoke-test"))
+    OpenAIResponsesModel("gpt-6-luna", provider=OpenAIProvider(api_key="smoke-test"))
+
+    required_resources = [
+        ("options.json",),
+        ("icons", "app_icon.png"),
+        ("backgrounds", "background_dark.png"),
+    ]
+    for parts in required_resources:
+        res_path = get_resource_path(*parts)
+        if not os.path.exists(res_path):
+            raise FileNotFoundError(f"Missing bundled resource: {res_path}")
+
+    print("Writing Tools smoke test passed.")
+    return 0
+
+
 def main() -> None:
     """Main entry point of the application."""
     _configure_logging()
+    if "--smoke-test" in sys.argv[1:]:
+        sys.exit(run_smoke_test())
+
     instance_lock = acquire_single_instance_lock()
     if instance_lock is None:
         logging.warning("Another instance of Writing Tools is already running; exiting.")

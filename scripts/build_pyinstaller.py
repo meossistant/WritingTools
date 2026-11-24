@@ -36,12 +36,12 @@ def run_pyinstaller_build() -> None:
         "--hidden-import", "tiktoken_ext",
         "--collect-data", "certifi",
         # Exclude unnecessary modules
+        # NOTE: do NOT exclude `unittest` — `logfire_api` (via `pydantic_graph` / `pydantic_ai`) imports it.
+        # NOTE: do NOT exclude `cryptography` — google-genai / pydantic-ai auth pulls it in.
         "--exclude-module", "tkinter",
-        "--exclude-module", "unittest",
         "--exclude-module", "IPython",
         "--exclude-module", "jedi",
         "--exclude-module", "email_validator",
-        # NOTE: do NOT exclude `cryptography` — google-genai / pydantic-ai auth pulls it in.
         "--exclude-module", "psutil",
         "--exclude-module", "pyzmq",
         "--exclude-module", "tornado",
