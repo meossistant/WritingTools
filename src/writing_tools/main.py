@@ -95,12 +95,14 @@ def run_smoke_test(log_path: str | None = None) -> int:
 
         msg = "Writing Tools smoke test passed.\n"
         _write_smoke_log(log_path, msg)
-        print(msg, end="")
+        if sys.stdout is not None:
+            sys.stdout.write(msg)
         return 0
     except BaseException:
         tb = traceback.format_exc()
         _write_smoke_log(log_path, tb)
-        sys.stderr.write(tb)
+        if sys.stderr is not None:
+            sys.stderr.write(tb)
         return 1
 
 

@@ -1,3 +1,4 @@
+import importlib.metadata
 import os
 import shutil
 import subprocess
@@ -6,6 +7,40 @@ import sys
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESOURCES_DIR = os.path.join(ROOT_DIR, "src", "writing_tools", "resources")
 ENTRY_SCRIPT = os.path.join(ROOT_DIR, "src", "writing_tools", "main.py")
+
+# Packages that query importlib.metadata.version()/distribution() at import or runtime
+_METADATA_PACKAGES = (
+    "anyio",
+    "genai-prices",
+    "google-auth",
+    "google-genai",
+    "griffelib",
+    "httpcore",
+    "httpcore2",
+    "httpx",
+    "httpx2",
+    "logfire-api",
+    "openai",
+    "opentelemetry-api",
+    "pydantic",
+    "pydantic-ai-slim",
+    "pydantic-graph",
+    "pydantic_core",
+    "Pygments",
+    "urllib3",
+    "websockets",
+)
+
+
+def _copy_metadata_args() -> list[str]:
+    args: list[str] = []
+    for pkg in _METADATA_PACKAGES:
+        try:
+            importlib.metadata.distribution(pkg)
+            args.extend(["--copy-metadata", pkg])
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return args
 
 
 def _add_data_arg(src: str, dest: str) -> str:
@@ -32,10 +67,11 @@ def run_pyinstaller_build() -> None:
         # Bundle runtime resources inside writing_tools/resources
         "--add-data", _add_data_arg(RESOURCES_DIR, os.path.join("writing_tools", "resources")),
         "--collect-submodules", "writing_tools",
-        # Ensure dynamic tokenizer encodings, platform backends, and CA certs are bundled in frozen builds
+        # Ensure dynamic tokenizer encodings, platform backends, package metadata, and CA certs are bundled
         "--hidden-import", "tiktoken_ext.openai_public",
         "--hidden-import", "tiktoken_ext",
         "--collect-data", "certifi",
+        *_copy_metadata_args(),
         *(
             [
                 "--hidden-import", "pynput.keyboard._win32",
