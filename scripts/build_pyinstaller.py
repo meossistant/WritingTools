@@ -31,10 +31,27 @@ def run_pyinstaller_build() -> None:
         "--paths", os.path.join(ROOT_DIR, "src"),
         # Bundle runtime resources inside writing_tools/resources
         "--add-data", _add_data_arg(RESOURCES_DIR, os.path.join("writing_tools", "resources")),
-        # Ensure dynamic tokenizer encodings and CA certs are bundled in frozen builds
+        "--collect-submodules", "writing_tools",
+        # Ensure dynamic tokenizer encodings, platform backends, and CA certs are bundled in frozen builds
         "--hidden-import", "tiktoken_ext.openai_public",
         "--hidden-import", "tiktoken_ext",
         "--collect-data", "certifi",
+        *(
+            [
+                "--hidden-import", "pynput.keyboard._win32",
+                "--hidden-import", "pynput.mouse._win32",
+                "--hidden-import", "pynput._util.win32",
+                "--hidden-import", "darkdetect._windows_detect",
+            ]
+            if is_windows
+            else [
+                "--hidden-import", "pynput.keyboard._xorg",
+                "--hidden-import", "pynput.mouse._xorg",
+                "--hidden-import", "pynput._util.xorg",
+                "--hidden-import", "darkdetect._linux_detect",
+                "--collect-submodules", "Xlib",
+            ]
+        ),
         # Exclude unnecessary modules
         # NOTE: do NOT exclude `unittest` — `logfire_api` (via `pydantic_graph` / `pydantic_ai`) imports it.
         # NOTE: do NOT exclude `cryptography` — google-genai / pydantic-ai auth pulls it in.

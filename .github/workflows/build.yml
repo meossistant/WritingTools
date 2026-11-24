@@ -60,7 +60,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $proc = Start-Process -FilePath "dist\Writing Tools.exe" -ArgumentList "--smoke-test" -Wait -PassThru
+          $logFile = Join-Path (Get-Location) "smoke_test.log"
+          $proc = Start-Process -FilePath "dist\Writing Tools.exe" `
+            -ArgumentList "--smoke-test", "--smoke-test-log=$logFile" -PassThru
+          if (-not $proc.WaitForExit(60000)) {
+            $proc.Kill()
+            if (Test-Path $logFile) { Get-Content $logFile }
+            Write-Error "Windows executable smoke test timed out after 60s"
+            exit 1
+          }
+          if (Test-Path $logFile) { Get-Content $logFile }
           if ($proc.ExitCode -ne 0) {
             Write-Error "Windows executable smoke test failed with exit code $($proc.ExitCode)"
             exit $proc.ExitCode
@@ -70,7 +79,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           chmod +x "dist/Writing Tools"
-          xvfb-run -a "./dist/Writing Tools" --smoke-test
+          xvfb-run -a "./dist/Writing Tools" --smoke-test --smoke-test-log=smoke_test.log
+          cat smoke_test.log
 
       - name: Stage Windows release files
         if: runner.os == 'Windows'
